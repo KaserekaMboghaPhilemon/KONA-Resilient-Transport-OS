@@ -49,6 +49,8 @@ import type {
 } from '../services/SyncManager';
 import { SyncManager } from '../services/SyncManager';
 
+import * as Haptics from 'expo-haptics';
+
 import type { QueueEntry, OfflineActionType } from '../db/LocalDatabase';
 import { getPendingQueueEntries } from '../db/LocalDatabase';
 
@@ -64,6 +66,21 @@ const POLL_INTERVAL_MS = 4_000;
  * temporary backoff state rather than a clean first-queued state.
  */
 const BACKOFF_THRESHOLD = 1;
+
+/**
+ * Milliseconds of sustained 'none' connectivity (with queue entries present)
+ * before the alarm banner activates and a haptic warning fires.
+ * Override via the alarmWarningDelayMs prop in tests (pass 0) so the alarm
+ * resolves as a microtask and is drainable by flushPromises().
+ */
+const ALARM_WARNING_DELAY_MS = 120_000; // 2 minutes
+
+/**
+ * Milliseconds of sustained 'none' connectivity before handleForceSync() is
+ * invoked automatically so entries are dispatched once a signal re-appears.
+ * Override via the autoSyncDelayMs prop in tests (pass 0).
+ */
+const AUTO_SYNC_DELAY_MS = 180_000; // 3 minutes
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Design tokens
@@ -544,6 +561,22 @@ export interface DriverSyncDashboardProps {
 
   /** Screen title displayed in the header bar. Defaults to "Sync Status". */
   title?: string;
+
+  /**
+   * Milliseconds after connectivity drops to 'none' (with entries present)
+   * before the alarm warning banner activates and a haptic fires.
+   * Defaults to ALARM_WARNING_DELAY_MS (120 000 ms).
+   * Pass 0 in tests — the delay then uses Promise.resolve() so it can be
+   * drained by flushPromises() without any fake-timer machinery.
+   */
+  alarmWarningDelayMs?: number;
+
+  /**
+   * Milliseconds after connectivity drops to 'none' (with entries present)
+   * before handleForceSync() is invoked automatically.
+   * Defaults to AUTO_SYNC_DELAY_MS (180 000 ms). Pass 0 in tests.
+   */
+  autoSyncDelayMs?: number;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -553,8 +586,10 @@ export interface DriverSyncDashboardProps {
 export default function DriverSyncDashboard({
   syncManager,
   connectivityProbe,
-  getPendingEntries = getPendingQueueEntries,
-  title             = 'Sync Status',
+  getPendingEntries    = getPendingQueueEntries,
+  title                = 'Sync Status',
+  alarmWarningDelayMs,
+  autoSyncDelayMs,
 }: DriverSyncDashboardProps) {
   // Live connectivity state — polled from the injected probe.
   const connectivityState = useConnectivity(connectivityProbe);
@@ -619,6 +654,63 @@ export default function DriverSyncDashboard({
       setIsSyncing(false);
     }
   }, [isSyncing, syncManager, animatePress]);
+
+  // ── Alarm & auto-sync deferral ────────────────────────────────────────────
+  // When the driver has unsynced entries and loses all connectivity, two
+  // background timers arm:
+  //
+  //   1. After alarmWarningDelayMs  — a haptic fires and the visual alarm
+  //      banner appears, alerting the driver that auto-dispatch is pending.
+  //   2. After autoSyncDelayMs      — handleForceSync() fires automatically
+  //      so queued payloads are transmitted once a signal re-appears.
+  //
+  // Delay idiom: when delay === 0 the timer uses Promise.resolve() (a
+  // microtask) instead of setTimeout so tests can drain it via flushPromises()
+  // without needing jest.useFakeTimers(), which clashes with React 19 act().
+  // ──────────────────────────────────────────────────────────────────────────
+  const [alarmActive, setAlarmActive] = useState(false);
+
+  const resolvedAlarmDelay    = alarmWarningDelayMs ?? ALARM_WARNING_DELAY_MS;
+  const resolvedAutoSyncDelay = autoSyncDelayMs     ?? AUTO_SYNC_DELAY_MS;
+
+  // Stable ref so the auto-sync timer always calls the latest handleForceSync
+  // without listing it as an effect dependency, which would restart the timers
+  // every time isSyncing toggles and could produce re-entrant sync calls.
+  const handleForceSyncRef = useRef(handleForceSync);
+  useEffect(() => { handleForceSyncRef.current = handleForceSync; }, [handleForceSync]);
+
+  useEffect(() => {
+    if (connectivityState !== 'none' || entryCount === 0) {
+      setAlarmActive(false);
+      return;
+    }
+
+    let alive = true;
+    const wait = (ms: number): Promise<void> =>
+      ms === 0
+        ? Promise.resolve()
+        : new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+    // Arm alarm warning.
+    void (async () => {
+      await wait(resolvedAlarmDelay);
+      if (!alive) return;
+      setAlarmActive(true);
+      void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
+    })();
+
+    // Arm auto-sync.
+    void (async () => {
+      await wait(resolvedAutoSyncDelay);
+      if (!alive) return;
+      void handleForceSyncRef.current();
+    })();
+
+    return () => { alive = false; };
+  // resolvedAlarmDelay / resolvedAutoSyncDelay are primitive numbers derived
+  // from props — React's rules of hooks require them in deps.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connectivityState, entryCount, resolvedAlarmDelay, resolvedAutoSyncDelay]);
 
   // Stable FlatList callbacks — recreating these on every render would reset
   // the virtualised list's internal scroll/measure state unnecessarily.
@@ -698,6 +790,16 @@ export default function DriverSyncDashboard({
           <>
             {/* Last sync summary */}
             {lastReport !== null && <LastSyncReport report={lastReport} />}
+
+            {/* Alarm / auto-sync countdown banner */}
+            {alarmActive && (
+              <View style={styles.alarmBanner}>
+                <Text style={styles.alarmTitle}>AUTO-SYNC QUEUED</Text>
+                <Text style={styles.alarmSubtitle}>
+                  No connectivity — auto-dispatch pending when signal returns
+                </Text>
+              </View>
+            )}
 
             {/* Sync error */}
             {syncError !== null && (
@@ -1055,6 +1157,28 @@ const styles = StyleSheet.create({
     fontSize:   12,
     color:      PALETTE.textSecondary,
     lineHeight: 18,
+  },
+
+  // ── Alarm countdown banner ─────────────────────────────────────────────────
+  alarmBanner: {
+    marginTop:       SPACING.md,
+    backgroundColor: PALETTE.amberDim,
+    borderRadius:    RADIUS.md,
+    borderWidth:     1,
+    borderColor:     PALETTE.amber,
+    padding:         SPACING.md,
+  },
+  alarmTitle: {
+    fontSize:      11,
+    fontWeight:    '700',
+    letterSpacing: 1.8,
+    color:         PALETTE.amber,
+    marginBottom:  4,
+  },
+  alarmSubtitle: {
+    fontSize:   12,
+    color:      PALETTE.amberAccent,
+    lineHeight: 16,
   },
 
   // ── Force sync button ──────────────────────────────────────────────────────

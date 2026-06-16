@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "expo-crypto": "^13.0.0",
+    "expo-haptics": "^56.0.3",
     "expo-sqlite": "^14.0.0",
     "lz-string": "^1.5.0"
   },
@@ -45,13 +46,21 @@
         "transform": {
           "^.+\\.[jt]sx?$": [
             "babel-jest",
-            { "configFile": "./babel.config.js" }
+            {
+              "configFile": "./babel.config.js"
+            }
           ]
         },
         "transformIgnorePatterns": [
           "node_modules/(?!(react-native|@react-native|expo|expo-modules-core|@expo|@testing-library)/)"
         ],
-        "moduleFileExtensions": ["ts", "tsx", "js", "jsx", "json"]
+        "moduleFileExtensions": [
+          "ts",
+          "tsx",
+          "js",
+          "jsx",
+          "json"
+        ]
       }
     ]
   }

@@ -190,11 +190,33 @@ jest.mock('expo-crypto', () => ({
 }));
 
 // ─────────────────────────────────────────────────────────────────────────────
+// expo-haptics mock — stubs the native haptic engine so the alarm path can be
+// verified without a physical device or Expo Go environment.
+// ─────────────────────────────────────────────────────────────────────────────
+
+jest.mock('expo-haptics', () => ({
+  NotificationFeedbackType: {
+    Success: 'success',
+    Warning: 'warning',
+    Error:   'error',
+  },
+  ImpactFeedbackStyle: {
+    Light:  'light',
+    Medium: 'medium',
+    Heavy:  'heavy',
+  },
+  notificationAsync: jest.fn().mockResolvedValue(undefined),
+  impactAsync:       jest.fn().mockResolvedValue(undefined),
+  selectionAsync:    jest.fn().mockResolvedValue(undefined),
+}));
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Imports — after mocks
 // ─────────────────────────────────────────────────────────────────────────────
 
 import React from 'react';
 import { act, render, fireEvent, waitFor } from '@testing-library/react-native';
+import * as Haptics from 'expo-haptics';
 
 import DriverSyncDashboard, {
   MOCK_PREVIEW_ENTRIES,
@@ -1155,5 +1177,110 @@ describe('5 — Error boundaries and fallback displays', () => {
     await waitFor(() => {
       expect(trackingFetch).toHaveBeenCalledTimes(2);
     });
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. Automated Alarm and Auto-Sync Deferral
+//
+// Verifies that when connectivity drops to 'none' with unsynced queue entries:
+//   a) the visual alarm banner and haptic fire after alarmWarningDelayMs, and
+//   b) processOfflineQueue() is called automatically after autoSyncDelayMs
+//      without any user-initiated press event.
+//
+// Timer design: alarmWarningDelayMs={0} and autoSyncDelayMs={0} cause the
+// component to use Promise.resolve() instead of setTimeout, making both timers
+// microtasks that flushPromises() can drain — no jest.useFakeTimers() required.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('6 — Automated Alarm and Auto-Sync Deferral', () => {
+  it('should trigger audio alarm and display countdown warning when connection drops with entries present', async () => {
+    const { probe: internetProbe } = makeProbe('internet');
+    const { probe: noneProbe }     = makeProbe('none');
+    const manager                  = makeMockSyncManager();
+    // Stable reference across rerenders so usePendingQueue doesn't reload.
+    const stableFetch              = async (): Promise<QueueEntry[]> => [FRESH_ENTRY];
+
+    // Mount in normal internet state so we can assert the transition.
+    const { getByText, queryByText, rerender } = await render(
+      <DriverSyncDashboard
+        syncManager={manager}
+        connectivityProbe={internetProbe}
+        getPendingEntries={stableFetch}
+        alarmWarningDelayMs={0}
+        autoSyncDelayMs={999_999}  // prevent auto-sync from firing during this test
+      />,
+    );
+
+    await flushPromises();
+
+    // Baseline: internet is active, alarm banner must not be present.
+    expect(getByText('INTERNET ACTIVE')).toBeTruthy();
+    expect(queryByText('AUTO-SYNC QUEUED')).toBeNull();
+
+    // Transition the probe to no-connectivity.  The rerender causes
+    // useConnectivity to poll the new probe immediately; the alarm effect
+    // re-arms with delay = 0, which resolves as a microtask.
+    await rerender(
+      <DriverSyncDashboard
+        syncManager={manager}
+        connectivityProbe={noneProbe}
+        getPendingEntries={stableFetch}
+        alarmWarningDelayMs={0}
+        autoSyncDelayMs={999_999}
+      />,
+    );
+
+    // First flush: connectivity state transitions to 'none', alarm effect arms.
+    // Second flush: the delay-0 microtask resolves — setAlarmActive(true) and
+    //               Haptics.notificationAsync are both called.
+    await flushPromises();
+    await flushPromises();
+
+    // Visual alarm banner must now be present in the layout tree.
+    expect(getByText('AUTO-SYNC QUEUED')).toBeTruthy();
+    expect(
+      getByText('No connectivity — auto-dispatch pending when signal returns'),
+    ).toBeTruthy();
+
+    // Haptic notification must have been requested exactly once with the
+    // Warning feedback type.
+    expect(Haptics.notificationAsync).toHaveBeenCalledTimes(1);
+    expect(Haptics.notificationAsync).toHaveBeenCalledWith(
+      Haptics.NotificationFeedbackType.Warning,
+    );
+  });
+
+  it('should automatically invoke handleForceSync when countdown deferral threshold clears', async () => {
+    const { probe } = makeProbe('none');
+    const manager   = makeMockSyncManager(async () => makeReport());
+
+    // Mount directly in 'none' state so the alarm effect arms on the first
+    // render.  Both delays are 0, so both timers resolve as microtasks and
+    // are drained within the flushPromises() rounds below.
+    await render(
+      <DriverSyncDashboard
+        syncManager={manager}
+        connectivityProbe={probe}
+        getPendingEntries={async (): Promise<QueueEntry[]> => [FRESH_ENTRY]}
+        alarmWarningDelayMs={0}
+        autoSyncDelayMs={0}
+      />,
+    );
+
+    // Round 1: drains the initial effect chain:
+    //   probe.getState() → setState('none') already 'none' (no-op)
+    //   getPendingEntries() → setEntries([FRESH_ENTRY]) → entryCount = 1
+    //   alarm effect fires: wait(0) = Promise.resolve() for both timers
+    // Round 2: drains the timer callbacks:
+    //   alarmTimer  → setAlarmActive(true) + Haptics.notificationAsync
+    //   autoSyncTimer → handleForceSyncRef.current() → processOfflineQueue()
+    //                 → setLastReport + setRefreshTrigger + setIsSyncing(false)
+    await flushPromises();
+    await flushPromises();
+
+    // processOfflineQueue must have been called exactly once by the background
+    // auto-sync timer — no user press event was dispatched in this test.
+    expect(manager.processOfflineQueue).toHaveBeenCalledTimes(1);
   });
 });
