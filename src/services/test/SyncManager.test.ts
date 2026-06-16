@@ -112,6 +112,21 @@ jest.mock('expo-sqlite', () => {
 });
 
 // ---------------------------------------------------------------------------
+// SQLiteSyncRepository mock — prevents it from touching expo-sqlite during
+// SyncManager tests. All methods are no-ops / empty returns.
+// ---------------------------------------------------------------------------
+
+jest.mock('../SQLiteSyncRepository', () => ({
+  SQLiteSyncRepository: {
+    initialize:    jest.fn().mockResolvedValue(undefined),
+    enqueue:       jest.fn().mockResolvedValue(true),
+    getActiveQueue: jest.fn().mockResolvedValue([]),
+    updateStatus:  jest.fn().mockResolvedValue(undefined),
+    dequeue:       jest.fn().mockResolvedValue(undefined),
+  },
+}));
+
+// ---------------------------------------------------------------------------
 // expo-crypto mock
 // ---------------------------------------------------------------------------
 

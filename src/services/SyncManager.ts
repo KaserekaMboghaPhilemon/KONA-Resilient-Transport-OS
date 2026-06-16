@@ -42,6 +42,8 @@ import {
 
 import { encodeActionToSMS } from '../utils/TelephonyBridge';
 
+import { SQLiteSyncRepository, type SyncQueueRow } from './SQLiteSyncRepository';
+
 // ---------------------------------------------------------------------------
 // Configuration constants
 // ---------------------------------------------------------------------------
@@ -173,6 +175,14 @@ export class SyncManager {
    * state-change events.
    */
   private isProcessing = false;
+
+  /**
+   * Lookup map from idempotency_key → SyncQueueRow built at the start of each
+   * processOfflineQueue() run. Used to correlate LocalDatabase QueueEntry
+   * objects with their corresponding SQLiteSyncRepository rows for id-based
+   * status updates.
+   */
+  private repoMap: Map<string, SyncQueueRow> = new Map();
 
   /**
    * Tracks the last observed connectivity state so the connectivity monitor
@@ -324,6 +334,11 @@ export class SyncManager {
       const pending = await getPendingQueueEntries(QUEUE_BATCH_SIZE);
       report.total_entries_processed = pending.length;
 
+      // Build a lookup map from idempotency_key → SyncQueueRow so processEntry
+      // can resolve the numeric id needed for SQLiteSyncRepository operations.
+      const repoQueue = await SQLiteSyncRepository.getActiveQueue();
+      this.repoMap = new Map(repoQueue.map((row) => [row.idempotency_key, row]));
+
       for (const entry of pending) {
         const entryResult = await this.processEntry(entry, connectivityAtStart);
         report.entry_results.push(entryResult);
@@ -430,10 +445,19 @@ export class SyncManager {
     }
 
     if (liveState === 'internet') {
+      // Mark the entry as TRANSMITTING in SQLiteSyncRepository before dispatching.
+      const repoRow = this.repoMap.get(entry.idempotency_key);
+      if (repoRow) {
+        await SQLiteSyncRepository.updateStatus(repoRow.id, 'TRANSMITTING');
+      }
       return this.processEntryViaHttps(entry, baseResult);
     }
 
     // liveState === 'sms_only'
+    const repoRow = this.repoMap.get(entry.idempotency_key);
+    if (repoRow) {
+      await SQLiteSyncRepository.updateStatus(repoRow.id, 'TRANSMITTING');
+    }
     return this.processEntryViaSms(entry, baseResult);
   }
 
@@ -473,6 +497,13 @@ export class SyncManager {
       }
 
       await markQueueEntryAsSynced(entry.idempotency_key);
+
+      // Permanently remove from SQLiteSyncRepository now that the server has
+      // acknowledged receipt.
+      const repoRow = this.repoMap.get(entry.idempotency_key);
+      if (repoRow) {
+        await SQLiteSyncRepository.dequeue(repoRow.id);
+      }
 
       return {
         ...baseResult,
@@ -525,6 +556,13 @@ export class SyncManager {
 
       await markQueueEntryAsSynced(entry.idempotency_key);
 
+      // Permanently remove from SQLiteSyncRepository now that the SMS gateway
+      // has accepted the message.
+      const repoRow = this.repoMap.get(entry.idempotency_key);
+      if (repoRow) {
+        await SQLiteSyncRepository.dequeue(repoRow.id);
+      }
+
       return {
         ...baseResult,
         outcome: 'synced_sms',
@@ -569,6 +607,14 @@ export class SyncManager {
 
     if (newAttemptCount >= MAX_RETRY_ATTEMPTS) {
       await markQueueEntryAsFailed(entry.idempotency_key);
+
+      // Dequeue permanently from SQLiteSyncRepository — entry is quarantined
+      // in LocalDatabase with sync_status = 'failed'.
+      const repoRow = this.repoMap.get(entry.idempotency_key);
+      if (repoRow) {
+        await SQLiteSyncRepository.dequeue(repoRow.id);
+      }
+
       return {
         ...baseResult,
         outcome: 'failed_permanently',
@@ -578,6 +624,12 @@ export class SyncManager {
         backoff_ms: null,
         transmission_path: path,
       };
+    }
+
+    // Back off and mark as FAILED_BACKOFF in SQLiteSyncRepository.
+    const repoRow = this.repoMap.get(entry.idempotency_key);
+    if (repoRow) {
+      await SQLiteSyncRepository.updateStatus(repoRow.id, 'FAILED_BACKOFF', 1);
     }
 
     const backoffMs = Math.min(
