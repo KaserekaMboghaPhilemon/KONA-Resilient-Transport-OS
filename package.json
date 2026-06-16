@@ -13,14 +13,46 @@
     "lz-string": "^1.5.0"
   },
   "devDependencies": {
+    "@testing-library/react-native": "^14.0.0",
     "@types/jest": "^29.5.0",
     "@types/lz-string": "^1.5.0",
+    "@types/react": "^19.2.17",
+    "@types/react-native": "^0.72.8",
     "jest": "^29.7.0",
+    "react": "^19.2.7",
+    "react-native": "^0.86.0",
     "ts-jest": "^29.2.0",
     "typescript": "^5.4.0"
   },
   "jest": {
-    "preset": "ts-jest",
-    "testEnvironment": "node"
+    "projects": [
+      {
+        "displayName": "unit",
+        "preset": "ts-jest",
+        "testEnvironment": "node",
+        "testMatch": [
+          "<rootDir>/src/db/**/*.test.ts",
+          "<rootDir>/src/services/**/*.test.ts"
+        ]
+      },
+      {
+        "displayName": "components",
+        "testEnvironment": "node",
+        "testMatch": [
+          "<rootDir>/src/components/**/*.test.tsx",
+          "<rootDir>/src/components/**/*.test.ts"
+        ],
+        "transform": {
+          "^.+\\.[jt]sx?$": [
+            "babel-jest",
+            { "configFile": "./babel.config.js" }
+          ]
+        },
+        "transformIgnorePatterns": [
+          "node_modules/(?!(react-native|@react-native|expo|expo-modules-core|@expo|@testing-library)/)"
+        ],
+        "moduleFileExtensions": ["ts", "tsx", "js", "jsx", "json"]
+      }
+    ]
   }
 }
