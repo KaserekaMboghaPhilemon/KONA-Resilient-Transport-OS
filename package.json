@@ -15,6 +15,7 @@
     "expo-location": "~56.0.18",
     "expo-sms": "~56.0.3",
     "expo-sqlite": "^14.0.0",
+    "expo-task-manager": "~56.0.19",
     "express": "^5.2.1",
     "knex": "^3.2.10",
     "lz-string": "^1.5.0",
