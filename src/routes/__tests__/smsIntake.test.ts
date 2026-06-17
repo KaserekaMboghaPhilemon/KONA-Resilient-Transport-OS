@@ -101,7 +101,7 @@ const PAYLOAD_BOOKING: Record<string, unknown> = {
 
 describe('smsIntake — POST /api/v1/sms/gateway-webhook', () => {
   /** Spy on SyncController.executeAction; re-created fresh before each test. */
-  let syncSpy: jest.SpyInstance<Promise<void>, [Record<string, unknown>]>;
+  let syncSpy: jest.SpyInstance<Promise<void>, [unknown], any>;
 
   beforeEach(() => {
     // Isolate the in-memory accumulation cache from every other test.
