@@ -1,5 +1,3 @@
-import { TripRepository } from '../repositories/TripRepository';
-
 /**
  * Sprint 8.5 – AppInitializer: Crash Recovery & Lifecycle Restoration
  *
@@ -28,6 +26,9 @@ export async function initializeAppWithCrashRecovery(): Promise<void> {
   console.log('[AppInitializer] Starting app initialization with crash recovery check...');
 
   try {
+    // Dynamically import repositories/services so Jest does not eagerly load expo modules.
+    const { TripRepository } = await import('../repositories/TripRepository');
+
     // Query for any trips left in ACTIVE state (device crash scenario)
     const activeTripIds = await TripRepository.getActiveTripIds();
 

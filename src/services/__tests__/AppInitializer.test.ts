@@ -6,18 +6,38 @@
  */
 
 // Mock dependencies before importing the module under test
-jest.mock('../../repositories/TripRepository');
-jest.mock('../BackgroundLocationWorker');
+jest.mock('../../repositories/TripRepository', () => ({
+  TripRepository: {
+    getActiveTripIds: jest.fn(),
+  },
+}));
+jest.mock('../BackgroundLocationWorker', () => ({
+  BackgroundLocationWorker: {
+    startTracking: jest.fn(),
+    stopTracking: jest.fn(),
+  },
+}));
 
 import {
   initializeAppWithCrashRecovery,
   asyncInitializeApp,
 } from '../AppInitializer';
-import { TripRepository } from '../../repositories/TripRepository';
-import { BackgroundLocationWorker } from '../BackgroundLocationWorker';
 
-const mockTripRepository = TripRepository as jest.Mocked<typeof TripRepository>;
-const mockBackgroundLocationWorker = BackgroundLocationWorker as jest.Mocked<typeof BackgroundLocationWorker>;
+const { TripRepository } = jest.requireMock('../../repositories/TripRepository') as {
+  TripRepository: {
+    getActiveTripIds: jest.Mock;
+  };
+};
+
+const { BackgroundLocationWorker } = jest.requireMock('../BackgroundLocationWorker') as {
+  BackgroundLocationWorker: {
+    startTracking: jest.Mock;
+    stopTracking: jest.Mock;
+  };
+};
+
+const mockTripRepository = TripRepository;
+const mockBackgroundLocationWorker = BackgroundLocationWorker;
 
 describe('AppInitializer – Crash Recovery', () => {
   beforeEach(() => {
