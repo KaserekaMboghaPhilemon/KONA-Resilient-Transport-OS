@@ -59,4 +59,24 @@ export class TripRepository {
       });
     });
   }
+
+  /**
+   * Fetches any active (uncompleted) trips from the database.
+   * Used for crash recovery: if a trip remains in ACTIVE state after device boot,
+   * the app should restart background location tracking (Sprint 8.5).
+   *
+   * @returns Array of trip objects with at least order_id field.
+   */
+  public static async getActiveTripIds(): Promise<string[]> {
+    try {
+      const rows = await knex('trips')
+        .where({ status: 'ACTIVE' })
+        .select('order_id');
+
+      return rows.map((row: { order_id: string }) => row.order_id);
+    } catch (error) {
+      console.error('[TripRepository] Failed to fetch active trips:', error);
+      return [];
+    }
+  }
 }

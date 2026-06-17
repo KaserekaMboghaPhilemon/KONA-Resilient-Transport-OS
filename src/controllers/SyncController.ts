@@ -6,6 +6,10 @@ import { TripRepository } from '../repositories/TripRepository';
  *
  * Receives fully-reassembled sync actions and routes them through explicit
  * Knex-powered repository calls.
+ *
+ * Integration with Sprint 8.5 – Lifecycle Binding:
+ * Hooks the BackgroundLocationWorker into START_RIDE and END_RIDE transitions
+ * to manage native GPS tracking lifecycle across trip state changes.
  */
 
 /**
@@ -128,6 +132,7 @@ export class SyncController {
 
   /**
    * Handles START_RIDE action: transitions trip from ASSIGNED to ACTIVE.
+   * Also triggers native background location tracking (Sprint 8.5).
    */
   private static async handleStartRide(
     payload: Record<string, unknown>,
@@ -136,7 +141,26 @@ export class SyncController {
     if (!tripId) {
       throw new TypeError('[SyncController] START_RIDE requires payload.order_id or payload.trip_id.');
     }
+
+    // Update trip status in database
     await TripRepository.updateTripStatus(tripId, 'ACTIVE');
+
+    // Trigger native background GPS tracking (Sprint 8.5 – Lifecycle Binding)
+    // Using dynamic import to avoid loading expo dependencies at module init time
+    console.log(
+      `[SyncController] 🚗 Activating native background telemetry stream for trip: ${tripId}`,
+    );
+    try {
+      const { BackgroundLocationWorker } = await import('../services/BackgroundLocationWorker');
+      await BackgroundLocationWorker.startTracking(tripId);
+    } catch (trackerError) {
+      console.error(
+        `[SyncController] Failed to start background location tracking for trip ${tripId}:`,
+        trackerError,
+      );
+      // Do not re-throw; the trip is active even if tracking init fails.
+      // The app will attempt recovery on next boot if tracking remains unavailable.
+    }
   }
 
   /**
@@ -160,6 +184,7 @@ export class SyncController {
 
   /**
    * Handles END_RIDE action: finalizes trip lifecycle and settlement ledger.
+   * Also deactivates native background location tracking (Sprint 8.5).
    */
   private static async handleEndRide(
     payload: Record<string, unknown>,
@@ -168,6 +193,24 @@ export class SyncController {
     if (!tripId) {
       throw new TypeError('[SyncController] END_RIDE requires payload.order_id or payload.trip_id.');
     }
+
+    // Stop native background GPS tracking (Sprint 8.5 – Lifecycle Binding)
+    // Using dynamic import to avoid loading expo dependencies at module init time
+    console.log(
+      '[SyncController] 🛑 Deactivating native background telemetry stream safely.',
+    );
+    try {
+      const { BackgroundLocationWorker } = await import('../services/BackgroundLocationWorker');
+      await BackgroundLocationWorker.stopTracking();
+    } catch (trackerError) {
+      console.error(
+        '[SyncController] Failed to stop background location tracking:',
+        trackerError,
+      );
+      // Do not re-throw; finalize the trip even if tracking stop fails.
+    }
+
+    // Finalize trip lifecycle and settlement
     await TripRepository.terminateTripLifecycle(tripId, payload);
   }
 }
