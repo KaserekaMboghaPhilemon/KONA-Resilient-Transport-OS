@@ -16,7 +16,9 @@
     "expo-sms": "~56.0.3",
     "expo-sqlite": "^14.0.0",
     "express": "^5.2.1",
-    "lz-string": "^1.5.0"
+    "knex": "^3.2.10",
+    "lz-string": "^1.5.0",
+    "pg": "^8.21.0"
   },
   "devDependencies": {
     "@testing-library/react-native": "^14.0.0",

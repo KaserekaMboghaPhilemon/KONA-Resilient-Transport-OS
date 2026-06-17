@@ -23,6 +23,22 @@ import request from 'supertest';
 import express, { Application } from 'express';
 import base45 from 'base45';
 
+jest.mock('../../repositories/IdempotencyRepository', () => ({
+  IdempotencyRepository: {
+    checkAndRegisterKey: jest.fn().mockResolvedValue(false),
+    releaseKey: jest.fn().mockResolvedValue(undefined),
+  },
+}));
+
+jest.mock('../../repositories/TripRepository', () => ({
+  TripRepository: {
+    createTripRecord: jest.fn().mockResolvedValue(undefined),
+    updateTripStatus: jest.fn().mockResolvedValue(undefined),
+    updateTripFare: jest.fn().mockResolvedValue(undefined),
+    terminateTripLifecycle: jest.fn().mockResolvedValue(undefined),
+  },
+}));
+
 import smsIntakeRouter from '../smsIntake';
 import { SMSReassemblyManager } from '../../services/SMSReassemblyManager';
 import { SyncController } from '../../controllers/SyncController';

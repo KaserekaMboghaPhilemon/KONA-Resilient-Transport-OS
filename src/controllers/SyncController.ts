@@ -1,21 +1,11 @@
+import { IdempotencyRepository } from '../repositories/IdempotencyRepository';
+import { TripRepository } from '../repositories/TripRepository';
+
 /**
- * Sprint 7 – SyncController: Core Transaction Routing Matrix
+ * Sprint 7.5 – SyncController: PostgreSQL transaction routing matrix
  *
- * Receives fully-reassembled, decoded action payloads from the SMS intake
- * path and routes them through the domain-specific transaction pipeline.
- *
- * Operational guarantees:
- *   – Strict type validation ensures idempotency_key, action_type, and
- *     payload fields are present and well-formed before routing.
- *   – In-memory processedIdempotencyKeys Set deduplicates retries so the
- *     same action never executes twice (idempotency defence).
- *   – Switch-statement routing dispatches to domain-specific handlers
- *     (CREATE_TRIP, START_RIDE, UPDATE_FARE, END_RIDE).
- *   – Exhaustive type checking at compile time prevents unhandled action
- *     types from reaching production.
- *
- * Domain handlers (currently stubs): Replace with direct Mongoose/SQL calls
- * when backend models are wired.
+ * Receives fully-reassembled sync actions and routes them through explicit
+ * Knex-powered repository calls.
  */
 
 /**
@@ -34,17 +24,6 @@ export interface KonaSyncAction {
 
 export class SyncController {
   /**
-   * In-memory tracking set of processed idempotency keys.
-   * When running on a single process or with sticky sessions, this Set
-   * prevents duplicate execution of the same sync action.
-   *
-   * For distributed deployments, swap this for a Redis SET or database
-   * lookup (e.g., SELECT 1 FROM processed_transactions WHERE key = ?)
-   * to coordinate idempotency across multiple server instances.
-   */
-  private static processedIdempotencyKeys = new Set<string>();
-
-  /**
    * Main entry point for processing verified, reassembled sync actions.
    * Handles idempotency defences and domain-specific routing.
    *
@@ -53,10 +32,6 @@ export class SyncController {
    * @throws {TypeError} When required fields are missing or malformed.
    */
   public static async executeAction(action: unknown): Promise<void> {
-    // ────────────────────────────────────────────────────────────────────
-    // 1. Structural Type Guard Validation
-    // ────────────────────────────────────────────────────────────────────
-
     if (!action || typeof action !== 'object') {
       throw new TypeError(
         '[SyncController] Invalid action format: Action must be an object.',
@@ -65,29 +40,39 @@ export class SyncController {
 
     const typedAction = action as Partial<KonaSyncAction>;
 
-    // Verify all three required fields are present and non-empty.
-    if (!typedAction.idempotency_key) {
+    if (
+      typeof typedAction.idempotency_key !== 'string' ||
+      typedAction.idempotency_key.trim().length === 0
+    ) {
       throw new TypeError(
-        '[SyncController] Missing required field: "idempotency_key".',
+        '[SyncController] Missing or malformed required field: "idempotency_key".',
       );
     }
-    if (!typedAction.action_type) {
+    if (
+      typedAction.action_type !== 'CREATE_TRIP' &&
+      typedAction.action_type !== 'START_RIDE' &&
+      typedAction.action_type !== 'UPDATE_FARE' &&
+      typedAction.action_type !== 'END_RIDE'
+    ) {
       throw new TypeError(
-        '[SyncController] Missing required field: "action_type".',
+        '[SyncController] Missing or malformed required field: "action_type".',
       );
     }
-    if (!typedAction.payload) {
-      throw new TypeError('[SyncController] Missing required field: "payload".');
+    if (
+      !typedAction.payload ||
+      typeof typedAction.payload !== 'object' ||
+      Array.isArray(typedAction.payload)
+    ) {
+      throw new TypeError('[SyncController] Missing or malformed required field: "payload".');
     }
 
     const { idempotency_key, action_type, payload } =
       typedAction as KonaSyncAction;
 
-    // ────────────────────────────────────────────────────────────────────
-    // 2. Idempotency Defence Check
-    // ────────────────────────────────────────────────────────────────────
-
-    if (this.processedIdempotencyKeys.has(idempotency_key)) {
+    const isDuplicate = await IdempotencyRepository.checkAndRegisterKey(
+      idempotency_key,
+    );
+    if (isDuplicate) {
       console.warn(
         `[SyncController] Idempotency Hit! Action ${idempotency_key} already ` +
           `processed. Skipping duplicate.`,
@@ -100,112 +85,89 @@ export class SyncController {
         `with key: ${idempotency_key}`,
     );
 
-    // ────────────────────────────────────────────────────────────────────
-    // 3. Domain Action Routing Table
-    // ────────────────────────────────────────────────────────────────────
+    try {
+      switch (action_type) {
+        case 'CREATE_TRIP':
+          await this.handleCreateTrip(payload);
+          break;
 
-    switch (action_type) {
-      case 'CREATE_TRIP':
-        await this.handleCreateTrip(payload);
-        break;
+        case 'START_RIDE':
+          await this.handleStartRide(payload);
+          break;
 
-      case 'START_RIDE':
-        await this.handleStartRide(payload);
-        break;
+        case 'UPDATE_FARE':
+          await this.handleUpdateFare(payload);
+          break;
 
-      case 'UPDATE_FARE':
-        await this.handleUpdateFare(payload);
-        break;
+        case 'END_RIDE':
+          await this.handleEndRide(payload);
+          break;
 
-      case 'END_RIDE':
-        await this.handleEndRide(payload);
-        break;
-
-      default:
-        // Exhaustive type check: TS will error if a case is missing.
-        // At runtime, this catch-all prevents unhandled types from
-        // corrupting the ledger.
-        const exhaustiveCheck: never = action_type;
-        throw new Error(
-          `[SyncController] Unhandled action type received: ${exhaustiveCheck}`,
-        );
+        default:
+          const exhaustiveCheck: never = action_type;
+          throw new Error(
+            `[SyncController] Unhandled action type received: ${exhaustiveCheck}`,
+          );
+      }
+    } catch (error) {
+      await IdempotencyRepository.releaseKey(idempotency_key);
+      throw error;
     }
 
-    // ────────────────────────────────────────────────────────────────────
-    // 4. Mark transaction as completed successfully
-    // ────────────────────────────────────────────────────────────────────
-
-    this.processedIdempotencyKeys.add(idempotency_key);
-    console.log(
-      `[SyncController] ✓ Action ${idempotency_key} completed and registered ` +
-        `in idempotency log.`,
-    );
+    console.log(`[SyncController] ✓ Action ${idempotency_key} completed successfully.`);
   }
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // Domain Handler Stubs — Replace with your direct Mongoose/SQL Model calls
-  // when backend models are fully wired.
-  // ─────────────────────────────────────────────────────────────────────────
 
   /**
    * Handles CREATE_TRIP action: writes a new trip assignment record.
-   * Expected payload fields: order_id, driver_id, origin, destination, etc.
    */
   private static async handleCreateTrip(
     payload: Record<string, unknown>,
   ): Promise<void> {
-    console.log(
-      '[SyncController] DB Operation: Writing new trip assignment record to cluster...',
-      payload,
-    );
-    // TODO: Replace with real model call:
-    // await TripModel.create(payload);
+    await TripRepository.createTripRecord(payload);
   }
 
   /**
    * Handles START_RIDE action: transitions trip from ASSIGNED to ACTIVE.
-   * Expected payload fields: trip_id, timestamp, driver_location, etc.
    */
   private static async handleStartRide(
     payload: Record<string, unknown>,
   ): Promise<void> {
-    console.log(
-      '[SyncController] DB Operation: Updating transit status to ACTIVE...',
-      payload,
-    );
-    // TODO: Replace with real model call:
-    // await TripModel.findByIdAndUpdate(payload.trip_id, { status: 'ACTIVE', started_at: Date.now() });
+    const tripId = String(payload.order_id ?? payload.trip_id ?? '');
+    if (!tripId) {
+      throw new TypeError('[SyncController] START_RIDE requires payload.order_id or payload.trip_id.');
+    }
+    await TripRepository.updateTripStatus(tripId, 'ACTIVE');
   }
 
   /**
-   * Handles UPDATE_FARE action: recalculates ledger accounting entries.
-   * Expected payload fields: trip_id, fare_minor, commission_bps, etc.
+   * Handles UPDATE_FARE action: updates the fare amount for a trip.
    */
   private static async handleUpdateFare(
     payload: Record<string, unknown>,
   ): Promise<void> {
-    console.log(
-      '[SyncController] DB Operation: Recalculating ledger accounting entries...',
-      payload,
-    );
-    // TODO: Replace with real model call:
-    // const { fare_minor, commission_bps } = payload;
-    // await LedgerEntryModel.updateMany({ trip_id: payload.trip_id }, { fare_minor, commission_bps });
+    const tripId = String(payload.order_id ?? payload.trip_id ?? '');
+    const amount = Number(payload.fare_amount ?? payload.final_fare ?? payload.fare_minor);
+
+    if (!tripId) {
+      throw new TypeError('[SyncController] UPDATE_FARE requires payload.order_id or payload.trip_id.');
+    }
+    if (!Number.isFinite(amount)) {
+      throw new TypeError('[SyncController] UPDATE_FARE requires a numeric fare field.');
+    }
+
+    await TripRepository.updateTripFare(tripId, amount);
   }
 
   /**
-   * Handles END_RIDE action: terminates ride cycle, finalizes payment splits.
-   * Expected payload fields: trip_id, final_fare, completion_timestamp, etc.
+   * Handles END_RIDE action: finalizes trip lifecycle and settlement ledger.
    */
   private static async handleEndRide(
     payload: Record<string, unknown>,
   ): Promise<void> {
-    console.log(
-      '[SyncController] DB Operation: Terminating ride cycle and finalizing payment allocations...',
-      payload,
-    );
-    // TODO: Replace with real model call:
-    // await TripModel.findByIdAndUpdate(payload.trip_id, { status: 'COMPLETED', completed_at: Date.now() });
-    // await LedgerEntryModel.finalizeSplit(payload.trip_id);
+    const tripId = String(payload.order_id ?? payload.trip_id ?? '');
+    if (!tripId) {
+      throw new TypeError('[SyncController] END_RIDE requires payload.order_id or payload.trip_id.');
+    }
+    await TripRepository.terminateTripLifecycle(tripId, payload);
   }
 }
