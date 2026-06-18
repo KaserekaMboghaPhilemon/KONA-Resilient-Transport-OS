@@ -110,6 +110,22 @@ export class SMSTransportManager implements SmsSenderAdapter {
     }
   }
 
+  /**
+   * Context-aware chunk transport for non-queue payloads such as telemetry
+   * slices. Delegates to the same chunked wire transport used by send().
+   */
+  async sendPayloadAsChunks(
+    payload: string,
+    context: 'SYNC' | 'TELEMETRY' = 'SYNC',
+  ): Promise<boolean> {
+    console.log(
+      `[SMSTransportManager] Context ${context}: sending payload ` +
+        `(${payload.length} chars) through chunked SMS transport.`,
+    );
+
+    return this.send(payload);
+  }
+
   // -------------------------------------------------------------------------
   // Payload helpers (kept public + static for unit testability)
   // -------------------------------------------------------------------------
