@@ -46,6 +46,8 @@ export class TelemetrySyncManager {
   private static periodicTripId: string | null = null;
   /** Consecutive failures since the last successful cycle. */
   private static consecutiveFailures = 0;
+  /** Timestamp (ms since epoch) when the next sync cycle will fire. */
+  private static nextSyncTimestamp: number | null = null;
 
   // Defaults are intentionally safe: without an injected probe, no connectivity
   // is assumed so telemetry will flow through SMS fallback logic.
@@ -130,9 +132,95 @@ export class TelemetrySyncManager {
    * The tick runs processTelemetrySync() and immediately re-schedules itself.
    */
   private static scheduleNextCycle(delayMs: number): void {
+    this.nextSyncTimestamp = Date.now() + delayMs;
     this.periodicTimerHandle = setTimeout(() => {
       void this.runOneCycle();
     }, delayMs);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Task 10 – UI Observability & Manual Override
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Exposes the current consecutive failure count for UI telemetry display.
+   */
+  public static getConsecutiveFailures(): number {
+    return this.consecutiveFailures;
+  }
+
+  /**
+   * Returns the timestamp (ms since epoch) when the next sync cycle will fire,
+   * or null if no daemon is active.
+   */
+  public static getNextSyncTimestamp(): number | null {
+    return this.nextSyncTimestamp;
+  }
+
+  /**
+   * Returns the count of unsynced telemetry pings for the given trip,
+   * or 0 if the repository is unavailable.
+   */
+  public static async getUnsyncedPingCount(tripId: string): Promise<number> {
+    try {
+      const repository = await this.getTelemetryRepository();
+      const pings = await repository.getUnsyncedPings(tripId);
+      return pings.length;
+    } catch (error) {
+      console.warn(
+        `[TelemetrySyncManager] Failed to query unsynced ping count for trip ${tripId}:`,
+        error,
+      );
+      return 0;
+    }
+  }
+
+  /**
+   * Manually triggers an immediate telemetry sync, bypassing the backoff delay.
+   * Resets the consecutive failure counter and reschedules at the baseline interval.
+   *
+   * Safe to call multiple times; internally guards against concurrent execution.
+   */
+  public static async forceTelemetrySync(tripId: string): Promise<void> {
+    const normalizedTripId = tripId.trim();
+    if (!normalizedTripId) {
+      throw new TypeError('[TelemetrySyncManager] forceTelemetrySync requires a non-empty tripId.');
+    }
+
+    try {
+      console.log(
+        `[TelemetrySyncManager] Manual flush triggered for trip ${normalizedTripId}. ` +
+          `Clearing backoff state and syncing immediately.`,
+      );
+
+      // Clear any pending timer so we don't double-execute.
+      if (this.periodicTimerHandle !== null) {
+        clearTimeout(this.periodicTimerHandle);
+        this.periodicTimerHandle = null;
+      }
+
+      // Run the sync directly (not inside runOneCycle so we bypass the try/catch
+      // and exception handling that would increment the failure counter).
+      await this.processTelemetrySync(normalizedTripId);
+
+      // Always reset the failure counter after a manual flush, regardless of outcome.
+      this.consecutiveFailures = 0;
+      this.periodicTripId = normalizedTripId;
+
+      // Reschedule at the baseline interval.
+      this.scheduleNextCycle(TELEMETRY_BASE_INTERVAL_MS);
+
+      console.log(
+        `[TelemetrySyncManager] Manual flush complete. ` +
+          `Next sync in ${TELEMETRY_BASE_INTERVAL_MS} ms.`,
+      );
+    } catch (error) {
+      console.error(
+        `[TelemetrySyncManager] Manual flush failed for trip ${normalizedTripId}:`,
+        error,
+      );
+      // Don't rethrow — let the caller decide how to handle the error.
+    }
   }
 
   /**

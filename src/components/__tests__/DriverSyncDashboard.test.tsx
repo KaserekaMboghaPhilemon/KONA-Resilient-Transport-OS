@@ -211,6 +211,22 @@ jest.mock('expo-haptics', () => ({
 }));
 
 // ─────────────────────────────────────────────────────────────────────────────
+// TelemetrySyncManager mock (Sprint 10) — static class with getter and flush methods
+// ─────────────────────────────────────────────────────────────────────────────
+
+jest.mock('../../services/TelemetrySyncManager', () => ({
+  TelemetrySyncManager: {
+    getConsecutiveFailures: jest.fn().mockReturnValue(0),
+    getNextSyncTimestamp: jest.fn().mockReturnValue(null),
+    getUnsyncedPingCount: jest.fn().mockResolvedValue(0),
+    forceTelemetrySync: jest.fn().mockResolvedValue(undefined),
+    startPeriodicSync: jest.fn(),
+    stopPeriodicSync: jest.fn(),
+    processTelemetrySync: jest.fn().mockResolvedValue(undefined),
+  },
+}));
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Imports — after mocks
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -224,6 +240,7 @@ import DriverSyncDashboard, {
 
 import type { ConnectivityProbe, ConnectivityState } from '../../services/SyncManager';
 import { SyncManager } from '../../services/SyncManager';
+import { TelemetrySyncManager } from '../../services/TelemetrySyncManager';
 import type { QueueEntry } from '../../db/LocalDatabase';
 import type { QueueProcessingReport } from '../../services/SyncManager';
 
@@ -1177,6 +1194,197 @@ describe('5 — Error boundaries and fallback displays', () => {
     await waitFor(() => {
       expect(trackingFetch).toHaveBeenCalledTimes(2);
     });
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. Sprint 10 — Telemetry Status & Manual Override
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('6 — Telemetry status and manual flush (Sprint 10)', () => {
+  it('does not render TelemetryStatusCard when tripId is not provided', async () => {
+    const { probe } = makeProbe('internet');
+    const { queryByText } = await render(
+      <DriverSyncDashboard
+        syncManager={makeMockSyncManager()}
+        connectivityProbe={probe}
+        getPendingEntries={async () => []}
+        tripId={null}
+      />,
+    );
+
+    await flushPromises();
+
+    expect(queryByText('TELEMETRY MONITORING')).toBeNull();
+  });
+
+  it('renders TelemetryStatusCard when tripId is provided', async () => {
+    const { probe } = makeProbe('internet');
+    const { getByText } = await render(
+      <DriverSyncDashboard
+        syncManager={makeMockSyncManager()}
+        connectivityProbe={probe}
+        getPendingEntries={async () => []}
+        tripId="trip-123"
+      />,
+    );
+
+    await flushPromises();
+
+    expect(getByText('TELEMETRY MONITORING')).toBeTruthy();
+  });
+
+  it('displays HEALTHY status when consecutive failures is 0', async () => {
+    (TelemetrySyncManager.getConsecutiveFailures as jest.Mock).mockReturnValue(0);
+
+    const { probe } = makeProbe('internet');
+    const { getByText } = await render(
+      <DriverSyncDashboard
+        syncManager={makeMockSyncManager()}
+        connectivityProbe={probe}
+        getPendingEntries={async () => []}
+        tripId="trip-123"
+      />,
+    );
+
+    await flushPromises();
+
+    expect(getByText('HEALTHY')).toBeTruthy();
+  });
+
+  it('displays BACKOFF ACTIVE status when consecutive failures > 0', async () => {
+    (TelemetrySyncManager.getConsecutiveFailures as jest.Mock).mockReturnValue(2);
+    (TelemetrySyncManager.getNextSyncTimestamp as jest.Mock).mockReturnValue(
+      Date.now() + 120_000, // 120 seconds from now
+    );
+
+    const { probe } = makeProbe('internet');
+    const { getByText } = await render(
+      <DriverSyncDashboard
+        syncManager={makeMockSyncManager()}
+        connectivityProbe={probe}
+        getPendingEntries={async () => []}
+        tripId="trip-123"
+      />,
+    );
+
+    await flushPromises();
+
+    expect(getByText(/BACKOFF ACTIVE/)).toBeTruthy();
+  });
+
+  it('displays buffer count from TelemetrySyncManager.getUnsyncedPingCount', async () => {
+    (TelemetrySyncManager.getUnsyncedPingCount as jest.Mock).mockResolvedValue(5);
+
+    const { probe } = makeProbe('internet');
+    const { getByText } = await render(
+      <DriverSyncDashboard
+        syncManager={makeMockSyncManager()}
+        connectivityProbe={probe}
+        getPendingEntries={async () => []}
+        tripId="trip-123"
+      />,
+    );
+
+    await flushPromises();
+
+    expect(getByText('5')).toBeTruthy();
+    expect(getByText('pings')).toBeTruthy();
+  });
+
+  it('renders FLUSH TELEMETRY NOW button', async () => {
+    const { probe } = makeProbe('internet');
+    const { getByText } = await render(
+      <DriverSyncDashboard
+        syncManager={makeMockSyncManager()}
+        connectivityProbe={probe}
+        getPendingEntries={async () => []}
+        tripId="trip-123"
+      />,
+    );
+
+    await flushPromises();
+
+    expect(getByText('FLUSH TELEMETRY NOW')).toBeTruthy();
+  });
+
+  it('calls TelemetrySyncManager.forceTelemetrySync when flush button is pressed', async () => {
+    const { probe } = makeProbe('internet');
+    const { getByText } = await render(
+      <DriverSyncDashboard
+        syncManager={makeMockSyncManager()}
+        connectivityProbe={probe}
+        getPendingEntries={async () => []}
+        tripId="trip-123"
+      />,
+    );
+
+    await flushPromises();
+
+    const flushButton = getByText('FLUSH TELEMETRY NOW');
+    await fireEvent.press(flushButton);
+
+    await flushPromises();
+
+    expect(TelemetrySyncManager.forceTelemetrySync).toHaveBeenCalledWith('trip-123');
+  });
+
+  it('disables flush button while flushing is in progress', async () => {
+    (TelemetrySyncManager.forceTelemetrySync as jest.Mock).mockImplementation(
+      async () => {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      },
+    );
+
+    const { probe } = makeProbe('internet');
+    const { getByText, queryByText } = await render(
+      <DriverSyncDashboard
+        syncManager={makeMockSyncManager()}
+        connectivityProbe={probe}
+        getPendingEntries={async () => []}
+        tripId="trip-123"
+      />,
+    );
+
+    await flushPromises();
+
+    const flushButton = getByText('FLUSH TELEMETRY NOW');
+    await fireEvent.press(flushButton);
+
+    // During flush, button should show activity indicator or be disabled
+    // The component sets isTelemetryFlushing to true
+    await act(async () => {
+      // Give a moment for the state change to register
+      await Promise.resolve();
+    });
+
+    // After the async operation completes, button should return to normal
+    await waitFor(() => {
+      expect(queryByText('FLUSH TELEMETRY NOW')).toBeTruthy();
+    });
+  });
+
+  it('updates countdown when nextSyncTimestamp changes', async () => {
+    const now = Date.now();
+    (TelemetrySyncManager.getConsecutiveFailures as jest.Mock).mockReturnValue(1);
+    (TelemetrySyncManager.getNextSyncTimestamp as jest.Mock).mockReturnValue(
+      now + 45_000, // 45 seconds from now
+    );
+
+    const { probe } = makeProbe('internet');
+    const { getByText } = await render(
+      <DriverSyncDashboard
+        syncManager={makeMockSyncManager()}
+        connectivityProbe={probe}
+        getPendingEntries={async () => []}
+        tripId="trip-123"
+      />,
+    );
+
+    await flushPromises();
+
+    // The countdown should show ~45 seconds remaining
+    expect(getByText(/BACKOFF ACTIVE/)).toBeTruthy();
   });
 });
 

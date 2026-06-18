@@ -48,6 +48,7 @@ import type {
   QueueProcessingReport,
 } from '../services/SyncManager';
 import { SyncManager } from '../services/SyncManager';
+import { TelemetrySyncManager } from '../services/TelemetrySyncManager';
 
 import * as Haptics from 'expo-haptics';
 
@@ -280,6 +281,90 @@ function usePendingQueue(
   return { entries, entryCount, isLoading, fetchError };
 }
 
+/**
+ * Sprint 10 — Telemetry Status Polling Hook
+ *
+ * Polls TelemetrySyncManager state at POLL_INTERVAL_MS, including:
+ *  - Consecutive failure count (for backoff detection)
+ *  - Next sync timestamp (for countdown display)
+ *  - Unsynced ping buffer count (for diagnostics)
+ */
+type UseTelemetryStatusResult = {
+  failures:         number;
+  nextSyncTime:     number | null;
+  bufferCount:      number;
+  isFlushing:       boolean;
+  countdownSeconds: number;
+};
+
+function useTelemetryStatus(tripId: string | null): UseTelemetryStatusResult {
+  const [failures, setFailures]           = useState(0);
+  const [nextSyncTime, setNextSyncTime]   = useState<number | null>(null);
+  const [bufferCount, setBufferCount]     = useState(0);
+  const [isFlushing, setIsFlushing]       = useState(false);
+  const [countdownSeconds, setCountdownSeconds] = useState(0);
+
+  // Poll TelemetrySyncManager state
+  useEffect(() => {
+    const normalizedTripId = tripId;
+    if (!normalizedTripId) {
+      // Reset state if tripId becomes null
+      setFailures(0);
+      setNextSyncTime(null);
+      setBufferCount(0);
+      setCountdownSeconds(0);
+      return;
+    }
+
+    let cancelled = false;
+
+    async function poll(): Promise<void> {
+      try {
+        const f = TelemetrySyncManager.getConsecutiveFailures();
+        const ts = TelemetrySyncManager.getNextSyncTimestamp();
+        const bc = await TelemetrySyncManager.getUnsyncedPingCount(
+          normalizedTripId as string,
+        );
+
+        if (!cancelled) {
+          setFailures(f);
+          setNextSyncTime(ts);
+          setBufferCount(bc);
+        }
+      } catch {
+        // Non-fatal — keep last known state and retry on the next tick.
+      }
+    }
+
+    void poll();
+    const handle = setInterval(() => void poll(), POLL_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(handle);
+    };
+  }, [tripId]);
+
+  // Update countdown every second
+  useEffect(() => {
+    if (!nextSyncTime) {
+      setCountdownSeconds(0);
+      return;
+    }
+
+    const updateCountdown = () => {
+      const now = Date.now();
+      const remaining = Math.max(0, Math.floor((nextSyncTime - now) / 1000));
+      setCountdownSeconds(remaining);
+    };
+
+    updateCountdown();
+    const handle = setInterval(updateCountdown, 1000);
+    return () => clearInterval(handle);
+  }, [nextSyncTime]);
+
+  return { failures, nextSyncTime, bufferCount, isFlushing, countdownSeconds };
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Sub-components
 // ─────────────────────────────────────────────────────────────────────────────
@@ -467,6 +552,75 @@ function QueueEntryRow({ entry }: { entry: QueueEntry }) {
   );
 }
 
+// ── TelemetryStatusCard ───────────────────────────────────────────────────────
+// Sprint 10: Displays telemetry daemon status, buffer count, and manual flush button
+
+function TelemetryStatusCard({
+  tripId,
+  onFlush,
+  isFlushing,
+}: {
+  tripId: string | null;
+  onFlush: () => Promise<void>;
+  isFlushing: boolean;
+}) {
+  if (!tripId) return null;
+
+  const telemetry = useTelemetryStatus(tripId);
+  const isHealthy = telemetry.failures === 0;
+  const statusText = isHealthy
+    ? 'HEALTHY'
+    : `BACKOFF ACTIVE · ${telemetry.countdownSeconds}s remaining`;
+  const statusColor = isHealthy ? PALETTE.emeraldAccent : PALETTE.amberAccent;
+  const statusBgColor = isHealthy ? PALETTE.emeraldDim : PALETTE.amberDim;
+
+  const handleFlushPress = useCallback(async () => {
+    if (isFlushing) return;
+    try {
+      await onFlush();
+    } catch (error) {
+      console.error('[TelemetryStatusCard] Manual flush failed:', error);
+    }
+  }, [isFlushing, onFlush]);
+
+  return (
+    <View style={styles.telemetryCard}>
+      <Text style={styles.telemetryLabel}>TELEMETRY MONITORING</Text>
+
+      <View style={styles.telemetryRow}>
+        <View style={[styles.telemetryStatus, { backgroundColor: statusBgColor }]}>
+          <Text style={[styles.telemetryStatusText, { color: statusColor }]}>
+            {statusText}
+          </Text>
+        </View>
+
+        <View style={styles.telemetryBuffer}>
+          <Text style={styles.telemetryBufferCount}>{telemetry.bufferCount}</Text>
+          <Text style={styles.telemetryBufferLabel}>
+            {telemetry.bufferCount === 1 ? 'ping' : 'pings'}
+          </Text>
+        </View>
+      </View>
+
+      <TouchableOpacity
+        onPress={handleFlushPress}
+        disabled={isFlushing}
+        activeOpacity={0.7}
+        style={[
+          styles.telemetryFlushButton,
+          isFlushing && styles.telemetryFlushButtonDisabled,
+        ]}
+      >
+        {isFlushing ? (
+          <ActivityIndicator size="small" color={PALETTE.textPrimary} />
+        ) : (
+          <Text style={styles.telemetryFlushButtonText}>FLUSH TELEMETRY NOW</Text>
+        )}
+      </TouchableOpacity>
+    </View>
+  );
+}
+
 // ── LastSyncReport ────────────────────────────────────────────────────────────
 
 function LastSyncReport({ report }: { report: QueueProcessingReport }) {
@@ -577,6 +731,13 @@ export interface DriverSyncDashboardProps {
    * Defaults to AUTO_SYNC_DELAY_MS (180 000 ms). Pass 0 in tests.
    */
   autoSyncDelayMs?: number;
+
+  /**
+   * Current trip ID for telemetry sync operations (Sprint 10).
+   * If provided, the TelemetryStatusCard is rendered with manual flush capability.
+   * Defaults to null (telemetry card hidden).
+   */
+  tripId?: string | null;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -590,6 +751,7 @@ export default function DriverSyncDashboard({
   title                = 'Sync Status',
   alarmWarningDelayMs,
   autoSyncDelayMs,
+  tripId               = null,
 }: DriverSyncDashboardProps) {
   // Live connectivity state — polled from the injected probe.
   const connectivityState = useConnectivity(connectivityProbe);
@@ -607,6 +769,9 @@ export default function DriverSyncDashboard({
   const [isSyncing, setIsSyncing]   = useState(false);
   const [lastReport, setLastReport] = useState<QueueProcessingReport | null>(null);
   const [syncError, setSyncError]   = useState<string | null>(null);
+
+  // Telemetry flush state (Sprint 10).
+  const [isTelemetryFlushing, setIsTelemetryFlushing] = useState(false);
 
   // Derived counts for the metric card pills.
   const { freshCount, retryingCount } = useMemo(() => ({
@@ -654,6 +819,24 @@ export default function DriverSyncDashboard({
       setIsSyncing(false);
     }
   }, [isSyncing, syncManager, animatePress]);
+
+  /**
+   * Sprint 10: Manual telemetry flush handler.
+   * Calls TelemetrySyncManager.forceTelemetrySync() to immediately transmit
+   * pending telemetry, bypassing any backoff delay.
+   */
+  const handleTelemetryFlush = useCallback(async () => {
+    if (isTelemetryFlushing || !tripId) return;
+    setIsTelemetryFlushing(true);
+    try {
+      await TelemetrySyncManager.forceTelemetrySync(tripId);
+      console.log('[DriverSyncDashboard] Telemetry flush completed successfully.');
+    } catch (error) {
+      console.error('[DriverSyncDashboard] Telemetry flush failed:', error);
+    } finally {
+      setIsTelemetryFlushing(false);
+    }
+  }, [isTelemetryFlushing, tripId]);
 
   // ── Alarm & auto-sync deferral ────────────────────────────────────────────
   // When the driver has unsynced entries and loses all connectivity, two
@@ -775,6 +958,13 @@ export default function DriverSyncDashboard({
               isSyncing={isSyncing}
               freshCount={freshCount}
               retryingCount={retryingCount}
+            />
+
+            {/* Telemetry status and manual flush (Sprint 10) */}
+            <TelemetryStatusCard
+              tripId={tripId}
+              onFlush={handleTelemetryFlush}
+              isFlushing={isTelemetryFlushing}
             />
 
             {/* Diagnostic list heading */}
@@ -1211,6 +1401,77 @@ const styles = StyleSheet.create({
   // ── Footer ─────────────────────────────────────────────────────────────────
   footerSpacer: {
     height: SPACING.xxl,
+  },
+
+  // ── Telemetry status card (Sprint 10) ──────────────────────────────────────
+  telemetryCard: {
+    marginTop:       SPACING.lg,
+    backgroundColor: PALETTE.surface,
+    borderRadius:    RADIUS.lg,
+    borderWidth:     1,
+    borderColor:     PALETTE.border,
+    paddingHorizontal: SPACING.lg,
+    paddingVertical:   SPACING.lg,
+  },
+  telemetryLabel: {
+    fontSize:      11,
+    fontWeight:    '700',
+    letterSpacing: 1.8,
+    color:         PALETTE.textTertiary,
+    marginBottom:  SPACING.md,
+  },
+  telemetryRow: {
+    flexDirection:  'row',
+    justifyContent: 'space-between',
+    alignItems:     'center',
+    marginBottom:   SPACING.lg,
+  },
+  telemetryStatus: {
+    flex: 1,
+    borderRadius: RADIUS.md,
+    paddingVertical: SPACING.sm,
+    paddingHorizontal: SPACING.md,
+    marginRight: SPACING.md,
+  },
+  telemetryStatusText: {
+    fontSize:      12,
+    fontWeight:    '600',
+    letterSpacing: 0.5,
+  },
+  telemetryBuffer: {
+    backgroundColor: PALETTE.surfaceAlt,
+    borderRadius:    RADIUS.md,
+    paddingVertical: SPACING.sm,
+    paddingHorizontal: SPACING.md,
+    alignItems:      'center',
+    justifyContent:  'center',
+  },
+  telemetryBufferCount: {
+    fontSize:      16,
+    fontWeight:    '700',
+    color:         PALETTE.textPrimary,
+  },
+  telemetryBufferLabel: {
+    fontSize:      10,
+    color:         PALETTE.textSecondary,
+    marginTop:     2,
+  },
+  telemetryFlushButton: {
+    backgroundColor: PALETTE.blue,
+    borderRadius:    RADIUS.md,
+    paddingVertical: SPACING.md,
+    alignItems:      'center',
+    justifyContent:  'center',
+  },
+  telemetryFlushButtonDisabled: {
+    backgroundColor: PALETTE.blueDim,
+    opacity:         0.6,
+  },
+  telemetryFlushButtonText: {
+    fontSize:      12,
+    fontWeight:    '700',
+    letterSpacing: 1.5,
+    color:         PALETTE.textPrimary,
   },
 });
 
