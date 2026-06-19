@@ -1,5 +1,7 @@
 import { IdempotencyRepository } from '../repositories/IdempotencyRepository';
 import { TripRepository } from '../repositories/TripRepository';
+import { DriverSecretRepository } from '../repositories/DriverSecretRepository';
+import { CryptoSignatureEngine } from '../services/CryptoSignatureEngine';
 
 /**
  * Sprint 7.5 – SyncController: PostgreSQL transaction routing matrix
@@ -26,6 +28,18 @@ export interface KonaSyncAction {
   payload: Record<string, unknown>;
 }
 
+interface KonaSecurityEnvelope {
+  __kona_signature_hex?: unknown;
+  __kona_raw_wire?: unknown;
+}
+
+export class SignatureAuthenticationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SignatureAuthenticationError';
+  }
+}
+
 export class SyncController {
   /**
    * Main entry point for processing verified, reassembled sync actions.
@@ -43,6 +57,7 @@ export class SyncController {
     }
 
     const typedAction = action as Partial<KonaSyncAction>;
+    const envelope = action as KonaSecurityEnvelope;
 
     if (
       typeof typedAction.idempotency_key !== 'string' ||
@@ -72,6 +87,8 @@ export class SyncController {
 
     const { idempotency_key, action_type, payload } =
       typedAction as KonaSyncAction;
+
+    await this.verifyIncomingSignature(payload, envelope);
 
     const isDuplicate = await IdempotencyRepository.checkAndRegisterKey(
       idempotency_key,
@@ -119,6 +136,64 @@ export class SyncController {
     }
 
     console.log(`[SyncController] ✓ Action ${idempotency_key} completed successfully.`);
+  }
+
+  /**
+   * Sprint 11.5 — cryptographic gate before any database mutation.
+   */
+  private static async verifyIncomingSignature(
+    payload: Record<string, unknown>,
+    envelope: KonaSecurityEnvelope,
+  ): Promise<void> {
+    const incomingSignature =
+      typeof envelope.__kona_signature_hex === 'string'
+        ? envelope.__kona_signature_hex.trim().toUpperCase()
+        : '';
+
+    // Legacy payloads with no signature metadata remain accepted.
+    if (!incomingSignature) {
+      return;
+    }
+
+    if (!/^[A-F0-9]{8}$/.test(incomingSignature)) {
+      throw new SignatureAuthenticationError(
+        '[SyncController] Invalid incoming signature format.',
+      );
+    }
+
+    const rawWirePayload =
+      typeof envelope.__kona_raw_wire === 'string' ? envelope.__kona_raw_wire : '';
+    if (!rawWirePayload) {
+      throw new SignatureAuthenticationError(
+        '[SyncController] Missing signed wire payload for verification.',
+      );
+    }
+
+    const driverId =
+      typeof payload.driver_id === 'string' ? payload.driver_id.trim() : '';
+    if (!driverId) {
+      throw new SignatureAuthenticationError(
+        '[SyncController] Missing payload.driver_id for signature verification.',
+      );
+    }
+
+    const secret = await DriverSecretRepository.getSecretByDriverId(driverId);
+    if (!secret) {
+      throw new SignatureAuthenticationError(
+        `[SyncController] No authentication secret registered for driver ${driverId}.`,
+      );
+    }
+
+    const expectedSignature = await CryptoSignatureEngine.generateSignature(
+      rawWirePayload,
+      secret,
+    );
+
+    if (expectedSignature !== incomingSignature) {
+      throw new SignatureAuthenticationError(
+        `[SyncController] Signature verification failed for driver ${driverId}.`,
+      );
+    }
   }
 
   /**

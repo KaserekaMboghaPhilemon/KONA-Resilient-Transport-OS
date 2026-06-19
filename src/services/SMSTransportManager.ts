@@ -1,6 +1,7 @@
 import * as SMS from 'expo-sms';
 
 import type { SmsSenderAdapter } from './SyncManager';
+import { CryptoSignatureEngine } from './CryptoSignatureEngine';
 
 // ---------------------------------------------------------------------------
 // Wire-frame metadata
@@ -40,6 +41,8 @@ export interface SMSChunk {
 
 export class SMSTransportManager implements SmsSenderAdapter {
   private static readonly CH_MAX_LEN = 160;
+  private static readonly FALLBACK_DEVICE_SECRET = 'KONA_LOCAL_FALLBACK_SECRET';
+  private static readonly UNSIGNED_SIGNATURE = '00000000';
 
   /** E.164 number for the KONA Base Station Gateway. */
   private static readonly GATEWAY_NUMBER = '+254700000000';
@@ -76,13 +79,17 @@ export class SMSTransportManager implements SmsSenderAdapter {
    * Returns false on any frame rejection or expo-sms error so SyncManager's
    * retry circuitry can schedule a backoff and re-attempt delivery.
    */
-  async send(wireString: string): Promise<boolean> {
+  async send(wireString: string, deviceSecret?: string): Promise<boolean> {
     const txId = SMSTransportManager.generateTxId();
-    const frames = SMSTransportManager.chunkify(wireString, txId);
+    const signatureHex = await SMSTransportManager.signPayload(
+      wireString,
+      deviceSecret,
+    );
+    const frames = SMSTransportManager.chunkify(wireString, txId, signatureHex);
 
     console.log(
       `[SMSTransportManager] TX ${txId}: dispatching ${frames.length} frame(s) ` +
-        `(wire length: ${wireString.length} chars).`,
+        `(wire length: ${wireString.length} chars, sig: ${signatureHex}).`,
     );
 
     try {
@@ -117,13 +124,14 @@ export class SMSTransportManager implements SmsSenderAdapter {
   async sendPayloadAsChunks(
     payload: string,
     context: 'SYNC' | 'TELEMETRY' = 'SYNC',
+    deviceSecret?: string,
   ): Promise<boolean> {
     console.log(
       `[SMSTransportManager] Context ${context}: sending payload ` +
         `(${payload.length} chars) through chunked SMS transport.`,
     );
 
-    return this.send(payload);
+    return this.send(payload, deviceSecret);
   }
 
   // -------------------------------------------------------------------------
@@ -162,23 +170,41 @@ export class SMSTransportManager implements SmsSenderAdapter {
   /**
    * Slices an already-encoded string into ≤160-char GSM text frames.
    * Each frame is prefixed with a tracking header:
-   *   KONA:{TXID}:{N}/{TOTAL}:{DATA}
-   * where the header overhead is budgeted at 20 characters so that data
-   * fragments are at most 140 characters each.
+  *   KONA:{TXID}:{N}/{TOTAL}:{SIG}:{DATA}
+  * where SIG is an 8-char uppercase hex signature fragment.
    *
    * For well-formed Base45 TelephonyBridge wire strings (≤160 chars) this
    * always returns a single frame, making multi-chunk delivery a transparent
    * safety net rather than a normal-path concern.
    */
-  public static chunkify(encodedStr: string, transmissionId: string): string[] {
-    const headerBudget    = 20;                                // "KONA:XXXX:00/00:" ≈ 16–20 chars
-    const dataPerChunk    = this.CH_MAX_LEN - headerBudget;   // 140 chars of data per frame
-    const totalChunks     = Math.ceil(encodedStr.length / dataPerChunk);
+  public static chunkify(
+    encodedStr: string,
+    transmissionId: string,
+    signatureHex: string = this.UNSIGNED_SIGNATURE,
+  ): string[] {
+    if (!encodedStr) {
+      return [];
+    }
+
+    const normalizedSig = this.normalizeSignature(signatureHex);
+
+    // Total chunk count impacts header width (e.g. 9/9 vs 10/10), so we
+    // converge on a stable chunk count before slicing the data payload.
+    let totalChunks = 1;
+    let dataPerChunk = this.computeDataPerChunk(transmissionId, totalChunks, normalizedSig);
+    let recomputedTotal = Math.ceil(encodedStr.length / dataPerChunk);
+
+    while (recomputedTotal !== totalChunks) {
+      totalChunks = recomputedTotal;
+      dataPerChunk = this.computeDataPerChunk(transmissionId, totalChunks, normalizedSig);
+      recomputedTotal = Math.ceil(encodedStr.length / dataPerChunk);
+    }
+
     const frames: string[] = [];
 
     for (let i = 0; i < totalChunks; i++) {
       const fragment = encodedStr.slice(i * dataPerChunk, (i + 1) * dataPerChunk);
-      frames.push(`KONA:${transmissionId}:${i + 1}/${totalChunks}:${fragment}`);
+      frames.push(`KONA:${transmissionId}:${i + 1}/${totalChunks}:${normalizedSig}:${fragment}`);
     }
 
     return frames;
@@ -194,6 +220,7 @@ export class SMSTransportManager implements SmsSenderAdapter {
    */
   public static async transmitPayloadViaSMS(
     payload: Record<string, unknown>,
+    deviceSecret?: string,
   ): Promise<boolean> {
     const available = await SMS.isAvailableAsync();
     if (!available) {
@@ -203,7 +230,8 @@ export class SMSTransportManager implements SmsSenderAdapter {
 
     const txId      = this.generateTxId();
     const compressed = this.compressPayload(payload);
-    const frames     = this.chunkify(compressed, txId);
+    const signatureHex = await this.signPayload(compressed, deviceSecret);
+    const frames     = this.chunkify(compressed, txId, signatureHex);
 
     console.log(
       `[SMSTransportManager] TX ${txId}: initiating legacy dispatch. ` +
@@ -236,5 +264,38 @@ export class SMSTransportManager implements SmsSenderAdapter {
   /** Generates a 4-character alphanumeric transmission ID. */
   private static generateTxId(): string {
     return Math.random().toString(36).substring(2, 6).toUpperCase();
+  }
+
+  /** Ensures all frame signatures are normalized to 8 uppercase hex chars. */
+  private static normalizeSignature(signatureHex: string): string {
+    const candidate = signatureHex.trim().toUpperCase();
+    return /^[A-F0-9]{8}$/.test(candidate) ? candidate : this.UNSIGNED_SIGNATURE;
+  }
+
+  /** Computes per-frame data capacity from dynamic header length. */
+  private static computeDataPerChunk(
+    transmissionId: string,
+    totalChunks: number,
+    signatureHex: string,
+  ): number {
+    const header = `KONA:${transmissionId}:${totalChunks}/${totalChunks}:${signatureHex}:`;
+    return Math.max(1, this.CH_MAX_LEN - header.length);
+  }
+
+  /** Generates an 8-char signature for a payload, with safe fallback behavior. */
+  private static async signPayload(payload: string, deviceSecret?: string): Promise<string> {
+    const secret = deviceSecret?.trim() || this.FALLBACK_DEVICE_SECRET;
+    if (!deviceSecret?.trim()) {
+      console.warn(
+        '[SMSTransportManager] deviceSecret missing, using fallback secret for signature generation.',
+      );
+    }
+
+    try {
+      return await CryptoSignatureEngine.generateSignature(payload, secret);
+    } catch (error) {
+      console.error('[SMSTransportManager] Signature generation failed. Falling back to UNSIGNED signature.', error);
+      return this.UNSIGNED_SIGNATURE;
+    }
   }
 }

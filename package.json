@@ -8,6 +8,7 @@
     "test": "jest --verbose"
   },
   "dependencies": {
+    "@noble/hashes": "^2.2.0",
     "base45": "^2.0.1",
     "expo-crypto": "^13.0.0",
     "expo-file-system": "~56.0.8",

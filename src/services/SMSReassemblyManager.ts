@@ -3,6 +3,7 @@
 interface SMSChunkAccumulator {
   sender: string;
   totalChunks: number;
+  signatureHex: string | null;
   fragments: Record<number, string>; // Maps chunkIndex --> dataFragment
   createdAt: Date;
 }
@@ -25,18 +26,19 @@ export class SMSReassemblyManager {
   ): Promise<Record<string, unknown> | null> {
     this.cleanExpiredTransmissions();
 
-    // Frame format: KONA:[TXID]:[N]/[T]:[DATA]
-    const headerRegex = /^KONA:([A-Z0-9]{4}):(\d+)\/(\d+):(.+)$/s;
-    const match = rawBody.match(headerRegex);
-
-    if (!match) {
+    const parsedFrame = this.parseFrame(rawBody);
+    if (!parsedFrame) {
       console.warn(`[SMS Intake] Invalid frame format received from ${sender}`);
       return null;
     }
 
-    const [, txId, nStr, tStr, dataFragment] = match;
-    const chunkIndex = parseInt(nStr, 10);
-    const totalChunks = parseInt(tStr, 10);
+    const {
+      txId,
+      chunkIndex,
+      totalChunks,
+      signatureHex,
+      dataFragment,
+    } = parsedFrame;
 
     console.log(
       `[SMS Intake] Received frame ${chunkIndex}/${totalChunks} for TXID: ${txId} from ${sender}`,
@@ -48,6 +50,7 @@ export class SMSReassemblyManager {
       record = {
         sender,
         totalChunks,
+        signatureHex,
         fragments: {},
         createdAt: new Date(),
       };
@@ -58,6 +61,12 @@ export class SMSReassemblyManager {
     // for this TXID, preventing spoofed injection into an active accumulation.
     if (record.sender !== sender) {
       console.error(`[SMS Intake] Security Violation: TXID ${txId} sender mismatch.`);
+      return null;
+    }
+
+    // Security: signed transmissions must keep a stable signature across all frames.
+    if (record.signatureHex !== signatureHex) {
+      console.error(`[SMS Intake] Security Violation: TXID ${txId} signature mismatch across frames.`);
       return null;
     }
 
@@ -72,6 +81,79 @@ export class SMSReassemblyManager {
 
     // Payload is still incomplete — waiting for more frames.
     return null;
+  }
+
+  /**
+   * Parses both Sprint 11 signed frames and legacy unsigned frames.
+   * Signed:   KONA:[TXID]:[N]/[T]:[SIG_HEX]:[DATA]
+   * Unsigned: KONA:[TXID]:[N]/[T]:[DATA]
+   */
+  private static parseFrame(rawBody: string): {
+    txId: string;
+    chunkIndex: number;
+    totalChunks: number;
+    signatureHex: string | null;
+    dataFragment: string;
+  } | null {
+    if (!rawBody.startsWith('KONA:')) {
+      return null;
+    }
+
+    const withoutPrefix = rawBody.slice('KONA:'.length);
+    const firstColon = withoutPrefix.indexOf(':');
+    if (firstColon <= 0) {
+      return null;
+    }
+
+    const txId = withoutPrefix.slice(0, firstColon);
+    if (!/^[A-Z0-9]{4}$/.test(txId)) {
+      return null;
+    }
+
+    const remainderAfterTx = withoutPrefix.slice(firstColon + 1);
+    const secondColon = remainderAfterTx.indexOf(':');
+    if (secondColon <= 0) {
+      return null;
+    }
+
+    const sequencePart = remainderAfterTx.slice(0, secondColon);
+    const payloadPart = remainderAfterTx.slice(secondColon + 1);
+
+    const sequenceMatch = sequencePart.match(/^(\d+)\/(\d+)$/);
+    if (!sequenceMatch) {
+      return null;
+    }
+
+    const chunkIndex = parseInt(sequenceMatch[1], 10);
+    const totalChunks = parseInt(sequenceMatch[2], 10);
+    if (!Number.isInteger(chunkIndex) || !Number.isInteger(totalChunks)) {
+      return null;
+    }
+
+    const sigSeparatorIndex = payloadPart.indexOf(':');
+    if (sigSeparatorIndex > 0) {
+      const sigCandidate = payloadPart.slice(0, sigSeparatorIndex).toUpperCase();
+      const dataCandidate = payloadPart.slice(sigSeparatorIndex + 1);
+
+      if (/^[A-F0-9]{8}$/.test(sigCandidate) && dataCandidate.length > 0) {
+        return {
+          txId,
+          chunkIndex,
+          totalChunks,
+          signatureHex: sigCandidate,
+          dataFragment: dataCandidate,
+        };
+      }
+    }
+
+    // Legacy unsigned fallback.
+    return {
+      txId,
+      chunkIndex,
+      totalChunks,
+      signatureHex: null,
+      dataFragment: payloadPart,
+    };
   }
 
   /**
@@ -94,6 +176,10 @@ export class SMSReassemblyManager {
       const decodedBuffer = base45.decode(fullWireString);
       const jsonString = decodedBuffer.toString('utf-8');
       const payload = JSON.parse(jsonString) as Record<string, unknown>;
+
+      // Pass signed-wire metadata downstream for server-side authentication.
+      payload.__kona_signature_hex = record.signatureHex;
+      payload.__kona_raw_wire = fullWireString;
 
       console.log(`[SMS Intake] Successfully reassembled and decoded TXID: ${txId}`);
 

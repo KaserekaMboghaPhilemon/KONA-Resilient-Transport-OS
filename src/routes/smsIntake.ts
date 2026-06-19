@@ -33,7 +33,7 @@
 
 import { Router, Request, Response } from 'express';
 import { SMSReassemblyManager } from '../services/SMSReassemblyManager';
-import { SyncController } from '../controllers/SyncController';
+import { SignatureAuthenticationError, SyncController } from '../controllers/SyncController';
 
 // ---------------------------------------------------------------------------
 // Type definitions
@@ -132,6 +132,14 @@ router.post(
         message: 'SMS segment accepted. Awaiting remaining frames.',
       });
     } catch (err) {
+      if (err instanceof SignatureAuthenticationError) {
+        res.status(401).json({
+          status: 'error',
+          message: err.message,
+        });
+        return;
+      }
+
       const message =
         err instanceof Error ? err.message : 'An unexpected error occurred.';
 

@@ -15,15 +15,19 @@
 // Mock dependencies before importing the module under test
 jest.mock('../../repositories/IdempotencyRepository');
 jest.mock('../../repositories/TripRepository');
+jest.mock('../../repositories/DriverSecretRepository');
 jest.mock('../../services/BackgroundLocationWorker');
 
 import { SyncController } from '../SyncController';
 import { IdempotencyRepository } from '../../repositories/IdempotencyRepository';
 import { TripRepository } from '../../repositories/TripRepository';
+import { DriverSecretRepository } from '../../repositories/DriverSecretRepository';
 import { BackgroundLocationWorker } from '../../services/BackgroundLocationWorker';
+import { CryptoSignatureEngine } from '../../services/CryptoSignatureEngine';
 
 const mockIdempotencyRepository = IdempotencyRepository as jest.Mocked<typeof IdempotencyRepository>;
 const mockTripRepository = TripRepository as jest.Mocked<typeof TripRepository>;
+const mockDriverSecretRepository = DriverSecretRepository as jest.Mocked<typeof DriverSecretRepository>;
 const mockBackgroundLocationWorker = BackgroundLocationWorker as jest.Mocked<typeof BackgroundLocationWorker>;
 
 describe('SyncController – Sprint 8.5 Lifecycle Binding Tests', () => {
@@ -31,6 +35,56 @@ describe('SyncController – Sprint 8.5 Lifecycle Binding Tests', () => {
     jest.clearAllMocks();
     mockIdempotencyRepository.checkAndRegisterKey.mockResolvedValue(false);
     mockIdempotencyRepository.releaseKey.mockResolvedValue(undefined);
+    mockDriverSecretRepository.getSecretByDriverId.mockResolvedValue('TEST_DRIVER_SECRET');
+  });
+
+  describe('Sprint 11.5 signature authentication gate', () => {
+    it('rejects execution when incoming signature does not match expected HMAC', async () => {
+      mockTripRepository.createTripRecord.mockResolvedValue(undefined);
+
+      const rawWire = 'WIRE_PAYLOAD_FOR_HMAC';
+      const badSignature = 'DEADBEEF';
+
+      const action = {
+        idempotency_key: 'idem-auth-001',
+        action_type: 'CREATE_TRIP' as const,
+        payload: {
+          order_id: 'trip-auth-1',
+          driver_id: 'driver-xyz',
+        },
+        __kona_raw_wire: rawWire,
+        __kona_signature_hex: badSignature,
+      };
+
+      await expect(SyncController.executeAction(action)).rejects.toThrow(
+        /Signature verification failed/i,
+      );
+      expect(mockTripRepository.createTripRecord).not.toHaveBeenCalled();
+    });
+
+    it('allows execution when signature matches expected HMAC', async () => {
+      mockTripRepository.createTripRecord.mockResolvedValue(undefined);
+
+      const rawWire = 'WIRE_PAYLOAD_FOR_HMAC_OK';
+      const validSignature = await CryptoSignatureEngine.generateSignature(
+        rawWire,
+        'TEST_DRIVER_SECRET',
+      );
+
+      const action = {
+        idempotency_key: 'idem-auth-002',
+        action_type: 'CREATE_TRIP' as const,
+        payload: {
+          order_id: 'trip-auth-2',
+          driver_id: 'driver-xyz',
+        },
+        __kona_raw_wire: rawWire,
+        __kona_signature_hex: validSignature,
+      };
+
+      await expect(SyncController.executeAction(action)).resolves.not.toThrow();
+      expect(mockTripRepository.createTripRecord).toHaveBeenCalledTimes(1);
+    });
   });
 
   describe('START_RIDE action – background location tracking', () => {

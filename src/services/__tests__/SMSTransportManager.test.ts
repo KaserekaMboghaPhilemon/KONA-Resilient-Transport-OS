@@ -37,6 +37,12 @@ jest.mock('expo-sms', () => ({
   sendSMSAsync:     jest.fn(),
 }));
 
+jest.mock('../CryptoSignatureEngine', () => ({
+  CryptoSignatureEngine: {
+    generateSignature: jest.fn().mockResolvedValue('A1B2C3D4'),
+  },
+}));
+
 import * as SMS from 'expo-sms';
 import { SMSTransportManager } from '../SMSTransportManager';
 
@@ -52,11 +58,14 @@ const mockSMS = SMS as jest.Mocked<typeof SMS>;
 /** Maximum characters in a single GSM text frame (160). */
 const CH_MAX_LEN = 160;
 
+/** Signature fixture used by SMSTransportManager mock signing path. */
+const SIGNATURE_HEX = 'A1B2C3D4';
+
 /**
- * Bytes reserved for the KONA tracking header: "KONA:XXXX:00/00:" ≈ 20 chars.
- * Data payload per frame = CH_MAX_LEN − HEADER_BUDGET = 140 chars.
+ * Bytes reserved for the KONA tracking header in signed format.
+ * Header: KONA:XXXX:N/T:SIGNATURE:
  */
-const HEADER_BUDGET = 20;
+const HEADER_BUDGET = `KONA:XXXX:1/1:${SIGNATURE_HEX}:`.length;
 
 /** Maximum data characters per chunk (140). */
 const DATA_PER_CHUNK = CH_MAX_LEN - HEADER_BUDGET;
@@ -77,19 +86,21 @@ interface ParsedFrame {
   txId:   string;
   index:  number;
   total:  number;
+  signature: string;
   data:   string;
 }
 
 function parseFrame(frame: string): ParsedFrame | null {
   // The data segment may contain any character including '/', so we match
-  // everything after the fourth colon as a single group.
-  const match = frame.match(/^KONA:([A-Z0-9]{4}):(\d+)\/(\d+):(.*)$/s);
+  // everything after the fifth colon as a single group.
+  const match = frame.match(/^KONA:([A-Z0-9]{4}):(\d+)\/(\d+):([A-F0-9]{8}):(.*)$/s);
   if (!match) return null;
   return {
     txId:  match[1],
     index: parseInt(match[2], 10),
     total: parseInt(match[3], 10),
-    data:  match[4],
+    signature: match[4],
+    data:  match[5],
   };
 }
 
@@ -197,7 +208,7 @@ describe('2 — send() single-frame transmission', () => {
     expect(addresses).toEqual([GATEWAY_NUMBER]);
   });
 
-  it('frame body matches KONA:TXID:1/1:DATA format', async () => {
+  it('frame body matches KONA:TXID:1/1:SIG:DATA format', async () => {
     const adapter    = await SMSTransportManager.create();
     const wireString = buildWireString(60);
 
@@ -209,6 +220,7 @@ describe('2 — send() single-frame transmission', () => {
     expect(parsed).not.toBeNull();
     expect(parsed!.index).toBe(1);
     expect(parsed!.total).toBe(1);
+    expect(parsed!.signature).toMatch(/^[A-F0-9]{8}$/);
   });
 
   it('frame data segment exactly matches the original wire string', async () => {
@@ -256,7 +268,7 @@ describe('3 — chunkify() multi-frame chunk splicing', () => {
     // Exactly 3 × DATA_PER_CHUNK = 420 chars → 3 frames.
     const input  = buildWireString(3 * DATA_PER_CHUNK);
     const txId   = 'A1B2';
-    const frames = SMSTransportManager.chunkify(input, txId);
+    const frames = SMSTransportManager.chunkify(input, txId, SIGNATURE_HEX);
 
     expect(frames).toHaveLength(3);
   });
@@ -265,7 +277,7 @@ describe('3 — chunkify() multi-frame chunk splicing', () => {
     // 2 × DATA_PER_CHUNK + 1 → 3 frames (last frame carries 1 char).
     const input  = buildWireString(2 * DATA_PER_CHUNK + 1);
     const txId   = 'Z9Y8';
-    const frames = SMSTransportManager.chunkify(input, txId);
+    const frames = SMSTransportManager.chunkify(input, txId, SIGNATURE_HEX);
 
     expect(frames).toHaveLength(3);
   });
@@ -273,7 +285,7 @@ describe('3 — chunkify() multi-frame chunk splicing', () => {
   it('all frames share the same TXID', () => {
     const input  = buildWireString(3 * DATA_PER_CHUNK);
     const txId   = 'CAFE';
-    const frames = SMSTransportManager.chunkify(input, txId);
+    const frames = SMSTransportManager.chunkify(input, txId, SIGNATURE_HEX);
 
     for (const frame of frames) {
       const parsed = parseFrame(frame);
@@ -285,7 +297,7 @@ describe('3 — chunkify() multi-frame chunk splicing', () => {
   it('frame indices are sequential starting at 1', () => {
     const input  = buildWireString(3 * DATA_PER_CHUNK);
     const txId   = 'BEEF';
-    const frames = SMSTransportManager.chunkify(input, txId);
+    const frames = SMSTransportManager.chunkify(input, txId, SIGNATURE_HEX);
 
     frames.forEach((frame, arrayIndex) => {
       const parsed = parseFrame(frame);
@@ -296,7 +308,7 @@ describe('3 — chunkify() multi-frame chunk splicing', () => {
   it('every frame carries the correct total chunk count', () => {
     const input  = buildWireString(3 * DATA_PER_CHUNK);
     const txId   = 'D00D';
-    const frames = SMSTransportManager.chunkify(input, txId);
+    const frames = SMSTransportManager.chunkify(input, txId, SIGNATURE_HEX);
 
     for (const frame of frames) {
       const parsed = parseFrame(frame);
@@ -307,7 +319,7 @@ describe('3 — chunkify() multi-frame chunk splicing', () => {
   it('concatenating all frame data segments exactly reconstructs the original input', () => {
     const input  = buildWireString(3 * DATA_PER_CHUNK + 55);
     const txId   = 'FACE';
-    const frames = SMSTransportManager.chunkify(input, txId);
+    const frames = SMSTransportManager.chunkify(input, txId, SIGNATURE_HEX);
 
     const reconstructed = frames
       .map((frame) => parseFrame(frame)!.data)
@@ -316,21 +328,21 @@ describe('3 — chunkify() multi-frame chunk splicing', () => {
     expect(reconstructed).toBe(input);
   });
 
-  it('frame headers follow the KONA:TXID:N/TOTAL:DATA format for each frame', () => {
+  it('frame headers follow the KONA:TXID:N/TOTAL:SIG:DATA format for each frame', () => {
     const chunkCount = 3;
     const input      = buildWireString(chunkCount * DATA_PER_CHUNK);
     const txId       = 'TEST';
-    const frames     = SMSTransportManager.chunkify(input, txId);
+    const frames     = SMSTransportManager.chunkify(input, txId, SIGNATURE_HEX);
 
     frames.forEach((frame, i) => {
       // Header up to but not including data: "KONA:TEST:{i+1}/{total}:"
-      const expectedHeaderPrefix = `KONA:${txId}:${i + 1}/${chunkCount}:`;
+      const expectedHeaderPrefix = `KONA:${txId}:${i + 1}/${chunkCount}:${SIGNATURE_HEX}:`;
       expect(frame.startsWith(expectedHeaderPrefix)).toBe(true);
     });
   });
 
   it('produces exactly one frame for an empty string input', () => {
-    const frames = SMSTransportManager.chunkify('', 'AA00');
+    const frames = SMSTransportManager.chunkify('', 'AA00', SIGNATURE_HEX);
     // Math.ceil(0 / 140) = 0 → no frames. Verify boundary behaviour.
     expect(frames).toHaveLength(0);
   });
@@ -369,7 +381,7 @@ describe('3 — chunkify() multi-frame chunk splicing', () => {
   it('frame data segments across a 3-chunk sequence have the expected lengths', () => {
     const input  = buildWireString(3 * DATA_PER_CHUNK);
     const txId   = 'XYZW';
-    const frames = SMSTransportManager.chunkify(input, txId);
+    const frames = SMSTransportManager.chunkify(input, txId, SIGNATURE_HEX);
 
     // All three chunks should carry exactly DATA_PER_CHUNK characters.
     for (const frame of frames) {

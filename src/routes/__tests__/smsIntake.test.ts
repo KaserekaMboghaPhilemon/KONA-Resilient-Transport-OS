@@ -22,6 +22,7 @@
 import request from 'supertest';
 import express, { Application } from 'express';
 import base45 from 'base45';
+import { createHmac } from 'crypto';
 
 jest.mock('../../repositories/IdempotencyRepository', () => ({
   IdempotencyRepository: {
@@ -39,9 +40,18 @@ jest.mock('../../repositories/TripRepository', () => ({
   },
 }));
 
+jest.mock('../../repositories/DriverSecretRepository', () => ({
+  DriverSecretRepository: {
+    getSecretByDriverId: jest.fn().mockResolvedValue('TEST_DRIVER_SECRET'),
+  },
+}));
+
 import smsIntakeRouter from '../smsIntake';
 import { SMSReassemblyManager } from '../../services/SMSReassemblyManager';
 import { SyncController } from '../../controllers/SyncController';
+import { DriverSecretRepository } from '../../repositories/DriverSecretRepository';
+
+const mockDriverSecretRepository = DriverSecretRepository as jest.Mocked<typeof DriverSecretRepository>;
 
 // ---------------------------------------------------------------------------
 // Express app fixture
@@ -61,10 +71,20 @@ app.use('/api/v1/sms', smsIntakeRouter);
 
 /**
  * Builds a KONA-protocol framed SMS string.
- * Format: KONA:[TXID]:[N]/[T]:[DATA]
+ * Format: KONA:[TXID]:[N]/[T]:[SIG]:[DATA]
  */
-function makeKonaFrame(txId: string, n: number, t: number, data: string): string {
-  return `KONA:${txId}:${n}/${t}:${data}`;
+function makeKonaFrame(
+  txId: string,
+  n: number,
+  t: number,
+  data: string,
+  signature: string = 'A1B2C3D4',
+): string {
+  return `KONA:${txId}:${n}/${t}:${signature}:${data}`;
+}
+
+function makeSignature(data: string, secret: string = 'TEST_DRIVER_SECRET'): string {
+  return createHmac('sha256', secret).update(data).digest('hex').slice(0, 8).toUpperCase();
 }
 
 /**
@@ -108,6 +128,7 @@ const SENDER_B = '+254700000002';
 const PAYLOAD_BOOKING: Record<string, unknown> = {
   action_type: 'booking_lock',
   order_id: 'ord-AAAA',
+  driver_id: 'driver-xyz',
   fare_minor: 4500,
 };
 
@@ -140,7 +161,7 @@ describe('smsIntake — POST /api/v1/sms/gateway-webhook', () => {
   describe('Vector 1 — Telecom gateway field normalisation (Twilio ↔ Africa\'s Talking)', () => {
     it('maps Twilio From/Body fields (urlencoded) to the reassembly engine and returns HTTP 200', async () => {
       const wire = encodePayload(PAYLOAD_BOOKING);
-      const frame = makeKonaFrame('TW01', 1, 1, wire);
+      const frame = makeKonaFrame('TW01', 1, 1, wire, makeSignature(wire));
 
       const res = await request(app)
         .post('/api/v1/sms/gateway-webhook')
@@ -157,7 +178,7 @@ describe('smsIntake — POST /api/v1/sms/gateway-webhook', () => {
 
     it('maps Africa\'s Talking from/text fields (JSON) to the reassembly engine and returns HTTP 200', async () => {
       const wire = encodePayload(PAYLOAD_BOOKING);
-      const frame = makeKonaFrame('AT01', 1, 1, wire);
+      const frame = makeKonaFrame('AT01', 1, 1, wire, makeSignature(wire));
 
       // Africa's Talking sends JSON bodies with lowercase field names.
       const res = await request(app)
@@ -175,7 +196,7 @@ describe('smsIntake — POST /api/v1/sms/gateway-webhook', () => {
     it('gives precedence to lowercase from/text over title-case From/Body when both are present', async () => {
       // The route uses `body.from ?? body.From`, so lowercase wins on conflict.
       const wire = encodePayload(PAYLOAD_BOOKING);
-      const frame = makeKonaFrame('MX01', 1, 1, wire);
+      const frame = makeKonaFrame('MX01', 1, 1, wire, makeSignature(wire));
 
       const res = await request(app)
         .post('/api/v1/sms/gateway-webhook')
@@ -199,24 +220,28 @@ describe('smsIntake — POST /api/v1/sms/gateway-webhook', () => {
 
   describe('Vector 2 — Partial frame returns HTTP 202 Accepted', () => {
     it('returns 202 when the first of a two-frame sequence arrives', async () => {
-      const [part1] = splitIntoTwoFrames(encodePayload(PAYLOAD_BOOKING));
+      const wire = encodePayload(PAYLOAD_BOOKING);
+      const [sigPart1] = splitIntoTwoFrames(wire);
+      const sig = makeSignature(wire);
 
       const res = await request(app)
         .post('/api/v1/sms/gateway-webhook')
         .type('form')
-        .send({ From: SENDER_A, Body: makeKonaFrame('PF01', 1, 2, part1) });
+        .send({ From: SENDER_A, Body: makeKonaFrame('PF01', 1, 2, sigPart1, sig) });
 
       expect(res.status).toBe(202);
       expect(res.body).toMatchObject({ status: 'accepted' });
     });
 
     it('does not invoke SyncController.executeAction() while the payload is incomplete', async () => {
-      const [part1] = splitIntoTwoFrames(encodePayload(PAYLOAD_BOOKING));
+      const wire = encodePayload(PAYLOAD_BOOKING);
+      const [part1] = splitIntoTwoFrames(wire);
+      const sig = makeSignature(wire);
 
       await request(app)
         .post('/api/v1/sms/gateway-webhook')
         .type('form')
-        .send({ From: SENDER_A, Body: makeKonaFrame('PF02', 1, 2, part1) });
+        .send({ From: SENDER_A, Body: makeKonaFrame('PF02', 1, 2, part1, sig) });
 
       expect(syncSpy).not.toHaveBeenCalled();
     });
@@ -225,12 +250,13 @@ describe('smsIntake — POST /api/v1/sms/gateway-webhook', () => {
       const wire = encodePayload(PAYLOAD_BOOKING);
       const [part1, part2] = splitIntoTwoFrames(wire);
       const txId = 'PF03';
+      const sig = makeSignature(wire);
 
       // First frame: sequence incomplete → 202, SyncController silent.
       const res1 = await request(app)
         .post('/api/v1/sms/gateway-webhook')
         .type('form')
-        .send({ From: SENDER_A, Body: makeKonaFrame(txId, 1, 2, part1) });
+        .send({ From: SENDER_A, Body: makeKonaFrame(txId, 1, 2, part1, sig) });
       expect(res1.status).toBe(202);
       expect(syncSpy).not.toHaveBeenCalled();
 
@@ -238,7 +264,7 @@ describe('smsIntake — POST /api/v1/sms/gateway-webhook', () => {
       const res2 = await request(app)
         .post('/api/v1/sms/gateway-webhook')
         .type('form')
-        .send({ From: SENDER_A, Body: makeKonaFrame(txId, 2, 2, part2) });
+        .send({ From: SENDER_A, Body: makeKonaFrame(txId, 2, 2, part2, sig) });
       expect(res2.status).toBe(200);
       expect(syncSpy).toHaveBeenCalledTimes(1);
     });
@@ -253,16 +279,17 @@ describe('smsIntake — POST /api/v1/sms/gateway-webhook', () => {
       const wire = encodePayload(PAYLOAD_BOOKING);
       const [part1, part2] = splitIntoTwoFrames(wire);
       const txId = 'CP01';
+      const sig = makeSignature(wire);
 
       await request(app)
         .post('/api/v1/sms/gateway-webhook')
         .type('form')
-        .send({ From: SENDER_A, Body: makeKonaFrame(txId, 1, 2, part1) });
+        .send({ From: SENDER_A, Body: makeKonaFrame(txId, 1, 2, part1, sig) });
 
       const res = await request(app)
         .post('/api/v1/sms/gateway-webhook')
         .type('form')
-        .send({ From: SENDER_A, Body: makeKonaFrame(txId, 2, 2, part2) });
+        .send({ From: SENDER_A, Body: makeKonaFrame(txId, 2, 2, part2, sig) });
 
       expect(res.status).toBe(200);
       // The full original object must survive the encode → split → stitch → decode roundtrip.
@@ -275,16 +302,17 @@ describe('smsIntake — POST /api/v1/sms/gateway-webhook', () => {
       const wire = encodePayload(PAYLOAD_BOOKING);
       const [part1, part2] = splitIntoTwoFrames(wire);
       const txId = 'CP02';
+      const sig = makeSignature(wire);
 
       await request(app)
         .post('/api/v1/sms/gateway-webhook')
         .type('form')
-        .send({ From: SENDER_A, Body: makeKonaFrame(txId, 1, 2, part1) });
+        .send({ From: SENDER_A, Body: makeKonaFrame(txId, 1, 2, part1, sig) });
 
       await request(app)
         .post('/api/v1/sms/gateway-webhook')
         .type('form')
-        .send({ From: SENDER_A, Body: makeKonaFrame(txId, 2, 2, part2) });
+        .send({ From: SENDER_A, Body: makeKonaFrame(txId, 2, 2, part2, sig) });
 
       expect(syncSpy).toHaveBeenCalledTimes(1);
 
@@ -298,7 +326,8 @@ describe('smsIntake — POST /api/v1/sms/gateway-webhook', () => {
     });
 
     it('returns a structured ok response body with a pipeline confirmation message', async () => {
-      const frame = makeKonaFrame('CP03', 1, 1, encodePayload(PAYLOAD_BOOKING));
+      const wire = encodePayload(PAYLOAD_BOOKING);
+      const frame = makeKonaFrame('CP03', 1, 1, wire, makeSignature(wire));
 
       const res = await request(app)
         .post('/api/v1/sms/gateway-webhook')
@@ -312,7 +341,8 @@ describe('smsIntake — POST /api/v1/sms/gateway-webhook', () => {
     });
 
     it('handles a single-frame (1/1) complete transmission without requiring multi-frame accumulation', async () => {
-      const singleFrame = makeKonaFrame('CP04', 1, 1, encodePayload(PAYLOAD_BOOKING));
+      const wire = encodePayload(PAYLOAD_BOOKING);
+      const singleFrame = makeKonaFrame('CP04', 1, 1, wire, makeSignature(wire));
 
       const res = await request(app)
         .post('/api/v1/sms/gateway-webhook')
@@ -333,18 +363,19 @@ describe('smsIntake — POST /api/v1/sms/gateway-webhook', () => {
       const wire = encodePayload(PAYLOAD_BOOKING);
       const [part1, part2] = splitIntoTwoFrames(wire);
       const txId = 'SP01';
+      const sig = makeSignature(wire);
 
       // SENDER_A registers the TXID by sending frame 1.
       await request(app)
         .post('/api/v1/sms/gateway-webhook')
         .type('form')
-        .send({ From: SENDER_A, Body: makeKonaFrame(txId, 1, 2, part1) });
+        .send({ From: SENDER_A, Body: makeKonaFrame(txId, 1, 2, part1, sig) });
 
       // SENDER_B attempts to complete the transmission using the same TXID.
       const spoofRes = await request(app)
         .post('/api/v1/sms/gateway-webhook')
         .type('form')
-        .send({ From: SENDER_B, Body: makeKonaFrame(txId, 2, 2, part2) });
+        .send({ From: SENDER_B, Body: makeKonaFrame(txId, 2, 2, part2, sig) });
 
       // processIncomingSegment() returns null on sender mismatch → route returns 202.
       expect(spoofRes.status).toBe(202);
@@ -356,25 +387,26 @@ describe('smsIntake — POST /api/v1/sms/gateway-webhook', () => {
       const wire = encodePayload(PAYLOAD_BOOKING);
       const [part1, part2] = splitIntoTwoFrames(wire);
       const txId = 'SP02';
+      const sig = makeSignature(wire);
 
       // SENDER_A registers frame 1.
       await request(app)
         .post('/api/v1/sms/gateway-webhook')
         .type('form')
-        .send({ From: SENDER_A, Body: makeKonaFrame(txId, 1, 2, part1) });
+        .send({ From: SENDER_A, Body: makeKonaFrame(txId, 1, 2, part1, sig) });
 
       // SENDER_B's spoof is rejected.
       await request(app)
         .post('/api/v1/sms/gateway-webhook')
         .type('form')
-        .send({ From: SENDER_B, Body: makeKonaFrame(txId, 2, 2, part2) });
+        .send({ From: SENDER_B, Body: makeKonaFrame(txId, 2, 2, part2, sig) });
 
       // SENDER_A's legitimate completion still succeeds because the accumulator
       // for txId was NOT corrupted by the blocked spoof frame.
       const legitRes = await request(app)
         .post('/api/v1/sms/gateway-webhook')
         .type('form')
-        .send({ From: SENDER_A, Body: makeKonaFrame(txId, 2, 2, part2) });
+        .send({ From: SENDER_A, Body: makeKonaFrame(txId, 2, 2, part2, sig) });
 
       expect(legitRes.status).toBe(200);
       expect(syncSpy).toHaveBeenCalledTimes(1);
@@ -526,7 +558,8 @@ describe('smsIntake — POST /api/v1/sms/gateway-webhook', () => {
     it('returns HTTP 500 and an error body when SyncController.executeAction() throws', async () => {
       syncSpy.mockRejectedValueOnce(new Error('Ledger pipeline offline'));
 
-      const frame = makeKonaFrame('ERR1', 1, 1, encodePayload(PAYLOAD_BOOKING));
+      const wire = encodePayload(PAYLOAD_BOOKING);
+      const frame = makeKonaFrame('ERR1', 1, 1, wire, makeSignature(wire));
 
       const res = await request(app)
         .post('/api/v1/sms/gateway-webhook')
@@ -537,6 +570,39 @@ describe('smsIntake — POST /api/v1/sms/gateway-webhook', () => {
       expect(res.body).toMatchObject({
         status: 'error',
         message: 'Ledger pipeline offline',
+      });
+    });
+
+    it('returns HTTP 401 when incoming signature does not match expected driver secret HMAC', async () => {
+      // Run real SyncController logic for this test so auth verification executes.
+      syncSpy.mockRestore();
+      syncSpy = jest.spyOn(SyncController, 'executeAction');
+
+      mockDriverSecretRepository.getSecretByDriverId.mockResolvedValue('TEST_DRIVER_SECRET');
+
+      const secureActionPayload = {
+        idempotency_key: 'secure-idem-001',
+        action_type: 'CREATE_TRIP',
+        payload: {
+          order_id: 'ord-secure-001',
+          driver_id: 'driver-xyz',
+          fare_minor: 4500,
+        },
+      };
+
+      const wire = encodePayload(secureActionPayload);
+      const badSignature = 'BAD0BAD0';
+      const frame = makeKonaFrame('AUTH', 1, 1, wire, badSignature);
+
+      const res = await request(app)
+        .post('/api/v1/sms/gateway-webhook')
+        .type('form')
+        .send({ From: SENDER_A, Body: frame });
+
+      expect(res.status).toBe(401);
+      expect(res.body).toMatchObject({
+        status: 'error',
+        message: expect.stringMatching(/signature verification failed/i),
       });
     });
   });

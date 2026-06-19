@@ -22,6 +22,13 @@ jest.mock('expo-sms', () => ({
   sendSMSAsync: jest.fn(),
 }));
 
+jest.mock('expo-crypto', () => ({
+  CryptoDigestAlgorithm: { SHA256: 'SHA-256' },
+  digestStringAsync: jest.fn().mockResolvedValue(
+    'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+  ),
+}));
+
 jest.mock('base45', () => ({
   encode: jest.fn((_buf: Buffer) => 'MOCK_B45_PAYLOAD'),
 }));
