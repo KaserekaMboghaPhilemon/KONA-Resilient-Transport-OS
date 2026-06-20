@@ -1511,6 +1511,8 @@ export const MOCK_PREVIEW_ENTRIES: QueueEntry[] = [
     attempt_count:      0,
     last_attempt_at:    null,
     synced_at:          null,
+    previous_row_hash:  'GENESIS_BLOCK_ANCHOR_00000000',
+    row_signature:      'MOCK_SIG_A',
     sync_status:        'pending',
   },
   {
@@ -1523,6 +1525,8 @@ export const MOCK_PREVIEW_ENTRIES: QueueEntry[] = [
     attempt_count:      1,
     last_attempt_at:    _PREVIEW_TS - 120_000,
     synced_at:          null,
+    previous_row_hash:  'MOCK_SIG_A',
+    row_signature:      'MOCK_SIG_B',
     sync_status:        'pending',
   },
   {
@@ -1535,6 +1539,8 @@ export const MOCK_PREVIEW_ENTRIES: QueueEntry[] = [
     attempt_count:      2,
     last_attempt_at:    _PREVIEW_TS - 90_000,
     synced_at:          null,
+    previous_row_hash:  'MOCK_SIG_B',
+    row_signature:      'MOCK_SIG_C',
     sync_status:        'pending',
   },
   {
@@ -1547,6 +1553,8 @@ export const MOCK_PREVIEW_ENTRIES: QueueEntry[] = [
     attempt_count:      0,
     last_attempt_at:    null,
     synced_at:          null,
+    previous_row_hash:  'MOCK_SIG_C',
+    row_signature:      'MOCK_SIG_D',
     sync_status:        'pending',
   },
   {
@@ -1559,6 +1567,8 @@ export const MOCK_PREVIEW_ENTRIES: QueueEntry[] = [
     attempt_count:      4,
     last_attempt_at:    _PREVIEW_TS - 18_000,
     synced_at:          null,
+    previous_row_hash:  'MOCK_SIG_D',
+    row_signature:      'MOCK_SIG_E',
     sync_status:        'pending',
   },
   {
@@ -1571,6 +1581,8 @@ export const MOCK_PREVIEW_ENTRIES: QueueEntry[] = [
     attempt_count:      0,
     last_attempt_at:    null,
     synced_at:          null,
+    previous_row_hash:  'MOCK_SIG_E',
+    row_signature:      'MOCK_SIG_F',
     sync_status:        'pending',
   },
 ];

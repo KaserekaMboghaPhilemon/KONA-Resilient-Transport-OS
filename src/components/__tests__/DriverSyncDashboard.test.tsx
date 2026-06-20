@@ -1322,18 +1322,25 @@ describe('6 — Telemetry status and manual flush (Sprint 10)', () => {
     await flushPromises();
 
     const flushButton = getByText('FLUSH TELEMETRY NOW');
-    await fireEvent.press(flushButton);
+    await act(async () => {
+      fireEvent.press(flushButton);
+      await Promise.resolve();
+    });
 
+    await waitFor(() => {
+      expect(TelemetrySyncManager.forceTelemetrySync).toHaveBeenCalledWith('trip-123');
+    });
+
+    // Ensure the async onFlush finally-path settles before test teardown.
     await flushPromises();
-
-    expect(TelemetrySyncManager.forceTelemetrySync).toHaveBeenCalledWith('trip-123');
   });
 
   it('disables flush button while flushing is in progress', async () => {
+    let resolveFlush!: () => void;
     (TelemetrySyncManager.forceTelemetrySync as jest.Mock).mockImplementation(
-      async () => {
-        await new Promise((resolve) => setTimeout(resolve, 100));
-      },
+      () => new Promise<void>((resolve) => {
+        resolveFlush = resolve;
+      }),
     );
 
     const { probe } = makeProbe('internet');
@@ -1349,19 +1356,24 @@ describe('6 — Telemetry status and manual flush (Sprint 10)', () => {
     await flushPromises();
 
     const flushButton = getByText('FLUSH TELEMETRY NOW');
-    await fireEvent.press(flushButton);
-
-    // During flush, button should show activity indicator or be disabled
-    // The component sets isTelemetryFlushing to true
     await act(async () => {
-      // Give a moment for the state change to register
+      fireEvent.press(flushButton);
       await Promise.resolve();
     });
 
-    // After the async operation completes, button should return to normal
+    expect(TelemetrySyncManager.forceTelemetrySync).toHaveBeenCalledWith('trip-123');
+    expect(queryByText('FLUSH TELEMETRY NOW')).toBeNull();
+
+    await act(async () => {
+      resolveFlush();
+      await Promise.resolve();
+    });
+
     await waitFor(() => {
       expect(queryByText('FLUSH TELEMETRY NOW')).toBeTruthy();
     });
+
+    await flushPromises();
   });
 
   it('updates countdown when nextSyncTimestamp changes', async () => {

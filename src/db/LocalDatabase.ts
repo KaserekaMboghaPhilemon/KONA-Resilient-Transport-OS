@@ -16,6 +16,7 @@
 import * as SQLite from 'expo-sqlite';
 import * as Crypto from 'expo-crypto';
 import LZString from 'lz-string';
+import { LocalLedgerGuard } from '../services/LocalLedgerGuard';
 
 // ---------------------------------------------------------------------------
 // Domain Types
@@ -53,6 +54,10 @@ export interface QueueEntry {
   last_attempt_at: number | null;
   synced_at: number | null;
   sync_status: QueueSyncStatus;
+  /** Hash of the row immediately preceding this one in the ledger chain. */
+  previous_row_hash: string;
+  /** HMAC-SHA256 computed over this row's payload bound to previous_row_hash. */
+  row_signature: string;
 }
 
 /** QueueEntry with payload_compressed replaced by the fully decoded object. */
@@ -96,6 +101,8 @@ const SQL_CREATE_OFFLINE_SYNC_QUEUE = `
     last_attempt_at     INTEGER  NULL,
     synced_at           INTEGER  NULL,
     sync_status         TEXT     NOT NULL DEFAULT 'pending',
+    previous_row_hash   TEXT     NOT NULL DEFAULT 'GENESIS_BLOCK_ANCHOR_00000000',
+    row_signature       TEXT     NOT NULL DEFAULT '',
     CHECK (sync_status IN ('pending', 'synced', 'failed'))
   )`.trim();
 
@@ -198,6 +205,7 @@ export async function queueOfflineTransaction(
   orderId: string,
   actionType: OfflineActionType,
   payload: Record<string, unknown>,
+  deviceSecret: string,
 ): Promise<QueueResult> {
   if (typeof orderId !== 'string' || orderId.trim().length === 0) {
     throw new TypeError(
@@ -217,15 +225,24 @@ export async function queueOfflineTransaction(
   // Typical KONA fare/ledger JSON payloads compress to 45-60% of original size.
   const payloadCompressed = LZString.compressToBase64(JSON.stringify(payload));
 
+  // Build the cryptographic ledger chain: bind this row's payload to the
+  // signature of the row immediately preceding it so any retroactive
+  // modification of an older record breaks the chain at audit time.
+  const previousHash = await LocalLedgerGuard.getLastRowSignature(db, 'offline_sync_queue');
+  const rowSignature = await LocalLedgerGuard.computeChainHash(payloadCompressed, previousHash, deviceSecret);
+
   const result = await db.runAsync(
     `INSERT OR IGNORE INTO offline_sync_queue
-       (idempotency_key, order_id, action_type, payload_compressed, created_at, sync_status)
-     VALUES (?, ?, ?, ?, ?, 'pending')`,
+       (idempotency_key, order_id, action_type, payload_compressed, created_at, sync_status,
+        previous_row_hash, row_signature)
+     VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)`,
     idempotencyKey,
     orderId,
     actionType,
     payloadCompressed,
     Date.now(),
+    previousHash,
+    rowSignature,
   );
 
   return {

@@ -29,6 +29,8 @@ jest.mock('expo-sqlite', () => {
     last_attempt_at: number | null;
     synced_at: number | null;
     sync_status: string;
+    previous_row_hash: string;
+    row_signature: string;
   };
 
   const store: MockRow[] = [];
@@ -43,8 +45,9 @@ jest.mock('expo-sqlite', () => {
         ...params: unknown[]
       ): Promise<{ changes: number; lastInsertRowId: number }> => {
         if (/INSERT OR IGNORE INTO offline_sync_queue/i.test(sql)) {
-          const [idempotencyKey, orderId, actionType, payloadCompressed, createdAt] =
-            params as [string, string, string, string, number];
+          const [idempotencyKey, orderId, actionType, payloadCompressed, createdAt,
+                 previousRowHash, rowSignature] =
+            params as [string, string, string, string, number, string, string];
 
           if (store.some((r) => r.idempotency_key === idempotencyKey)) {
             return { changes: 0, lastInsertRowId: -1 };
@@ -62,6 +65,8 @@ jest.mock('expo-sqlite', () => {
             last_attempt_at: null,
             synced_at: null,
             sync_status: 'pending',
+            previous_row_hash: previousRowHash,
+            row_signature: rowSignature,
           });
           return { changes: 1, lastInsertRowId: nextId };
         }
@@ -97,7 +102,15 @@ jest.mock('expo-sqlite', () => {
       },
     ),
 
-    getFirstAsync: jest.fn().mockResolvedValue(null),
+    getFirstAsync: jest.fn().mockImplementation(
+      async (sql: string): Promise<{ row_signature: string } | null> => {
+        if (/SELECT row_signature FROM/i.test(sql)) {
+          if (store.length === 0) return null;
+          return { row_signature: store[store.length - 1].row_signature };
+        }
+        return null;
+      },
+    ),
     closeAsync: jest.fn().mockResolvedValue(undefined),
   };
 
@@ -161,6 +174,7 @@ import {
 
 const FIXTURE_ORDER_ID = 'b1a2c3d4-e5f6-7890-abcd-ef1234567890';
 const FIXTURE_ACTION: OfflineActionType = 'booking_lock';
+const DEVICE_SECRET = 'test-device-secret-key';
 
 // Mirrors exactly the fields a booking_lock ledger transaction would carry
 // based on the ride_orders and booking_escrows tables in SPRINT1_SCHEMA.sql.
@@ -197,6 +211,7 @@ describe('LocalDatabase - offline_sync_queue', () => {
         FIXTURE_ORDER_ID,
         FIXTURE_ACTION,
         FIXTURE_PAYLOAD,
+        DEVICE_SECRET,
       );
 
       expect(result.inserted).toBe(true);
@@ -218,6 +233,11 @@ describe('LocalDatabase - offline_sync_queue', () => {
       expect(entry.synced_at).toBeNull();
       expect(typeof entry.payload_compressed).toBe('string');
       expect(entry.payload_compressed.length).toBeGreaterThan(0);
+      // Sprint 12: chain columns must be populated on every insert.
+      expect(typeof entry.previous_row_hash).toBe('string');
+      expect(entry.previous_row_hash.length).toBeGreaterThan(0);
+      expect(typeof entry.row_signature).toBe('string');
+      expect(entry.row_signature.length).toBeGreaterThan(0);
     });
 
     it('roundtrips the payload through lz-string with exact structural fidelity', async () => {
@@ -232,6 +252,7 @@ describe('LocalDatabase - offline_sync_queue', () => {
         FIXTURE_ORDER_ID,
         FIXTURE_ACTION,
         FIXTURE_PAYLOAD,
+        DEVICE_SECRET,
       );
 
       expect(duplicate.inserted).toBe(false);
@@ -293,6 +314,7 @@ describe('LocalDatabase - offline_sync_queue', () => {
         'sync-test-order-synced',
         'trip_settlement',
         { fare_minor: 1000, driver_share_bps: 8000, kona_commission_bps: 2000 },
+        DEVICE_SECRET,
       );
       await expect(markQueueEntryAsSynced(r.idempotency_key)).resolves.toBeUndefined();
     });
@@ -304,6 +326,7 @@ describe('LocalDatabase - offline_sync_queue', () => {
         'increment-test-order',
         'order_status_update',
         { status: 'in_trip' },
+        DEVICE_SECRET,
       );
       await expect(
         incrementQueueEntryAttemptCount(r.idempotency_key),
@@ -317,6 +340,7 @@ describe('LocalDatabase - offline_sync_queue', () => {
         'failed-test-order',
         'booking_reversal',
         { reversal_reason: 'timeout' },
+        DEVICE_SECRET,
       );
       await expect(
         markQueueEntryAsFailed(r.idempotency_key),
@@ -331,19 +355,19 @@ describe('LocalDatabase - offline_sync_queue', () => {
   describe('input validation', () => {
     it('throws TypeError when orderId is an empty string', async () => {
       await expect(
-        queueOfflineTransaction('', 'booking_lock', {}),
+        queueOfflineTransaction('', 'booking_lock', {}, DEVICE_SECRET),
       ).rejects.toThrow(TypeError);
     });
 
     it('throws TypeError when orderId contains only whitespace', async () => {
       await expect(
-        queueOfflineTransaction('   ', 'booking_lock', {}),
+        queueOfflineTransaction('   ', 'booking_lock', {}, DEVICE_SECRET),
       ).rejects.toThrow(TypeError);
     });
 
     it('throws TypeError when actionType is falsy', async () => {
       await expect(
-        queueOfflineTransaction('some-order-id', '' as OfflineActionType, {}),
+        queueOfflineTransaction('some-order-id', '' as OfflineActionType, {}, DEVICE_SECRET),
       ).rejects.toThrow(TypeError);
     });
   });
@@ -356,7 +380,7 @@ describe('LocalDatabase - offline_sync_queue', () => {
     it('throws when queueOfflineTransaction is called before initDatabase', async () => {
       await _resetDatabaseForTesting();
       await expect(
-        queueOfflineTransaction(FIXTURE_ORDER_ID, FIXTURE_ACTION, FIXTURE_PAYLOAD),
+        queueOfflineTransaction(FIXTURE_ORDER_ID, FIXTURE_ACTION, FIXTURE_PAYLOAD, DEVICE_SECRET),
       ).rejects.toThrow('[LocalDatabase] initDatabase() must be called before');
       // Re-initialise for any remaining tests.
       await initDatabase();

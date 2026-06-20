@@ -28,6 +28,8 @@ jest.mock('expo-sqlite', () => {
     last_attempt_at: number | null;
     synced_at: number | null;
     sync_status: string;
+    previous_row_hash: string;
+    row_signature: string;
   };
 
   const store: MockRow[] = [];
@@ -42,8 +44,9 @@ jest.mock('expo-sqlite', () => {
         ...params: unknown[]
       ): Promise<{ changes: number; lastInsertRowId: number }> => {
         if (/INSERT OR IGNORE INTO offline_sync_queue/i.test(sql)) {
-          const [idempotencyKey, orderId, actionType, payloadCompressed, createdAt] =
-            params as [string, string, string, string, number];
+          const [idempotencyKey, orderId, actionType, payloadCompressed, createdAt,
+                 previousRowHash, rowSignature] =
+            params as [string, string, string, string, number, string, string];
           if (store.some((r) => r.idempotency_key === idempotencyKey)) {
             return { changes: 0, lastInsertRowId: -1 };
           }
@@ -59,6 +62,8 @@ jest.mock('expo-sqlite', () => {
             last_attempt_at: null,
             synced_at: null,
             sync_status: 'pending',
+            previous_row_hash: previousRowHash,
+            row_signature: rowSignature,
           });
           return { changes: 1, lastInsertRowId: nextId };
         }
@@ -95,7 +100,15 @@ jest.mock('expo-sqlite', () => {
       },
     ),
 
-    getFirstAsync: jest.fn().mockResolvedValue(null),
+    getFirstAsync: jest.fn().mockImplementation(
+      async (sql: string): Promise<{ row_signature: string } | null> => {
+        if (/SELECT row_signature FROM/i.test(sql)) {
+          if (store.length === 0) return null;
+          return { row_signature: store[store.length - 1].row_signature };
+        }
+        return null;
+      },
+    ),
     closeAsync: jest.fn().mockResolvedValue(undefined),
   };
 
@@ -212,8 +225,9 @@ const ORDER_D = 'dddddddd-0000-4000-8000-000000000004';
 const ORDER_E = 'eeeeeeee-0000-4000-8000-000000000005';
 const ORDER_F = 'ffffffff-0000-4000-8000-000000000006';
 
+const DEVICE_SECRET = 'test-device-secret-key';
+
 // ---------------------------------------------------------------------------
-// Adapter factories
 // ---------------------------------------------------------------------------
 
 function makeControllableProbe(): {
@@ -283,7 +297,7 @@ describe('Phase 1 Ã¢â‚¬â€ connectivity: none', () => {
       [ORDER_E, 'order_status_update',     { status: 'in_trip' }],
       [ORDER_F, 'dispatch_offer_response', { accepted: true, bid_amount_minor: 3800 }],
     ] as Array<[string, OfflineActionType, Record<string, unknown>]>) {
-      await queueOfflineTransaction(orderId, actionType, payload);
+      await queueOfflineTransaction(orderId, actionType, payload, DEVICE_SECRET);
     }
 
     const { probe } = makeControllableProbe();
@@ -335,7 +349,7 @@ describe('Phase 2 Ã¢â‚¬â€ connectivity: internet', () => {
       [ORDER_B, 'trip_settlement',   { fare_minor: 4500, driver_share_bps: 8000, kona_commission_bps: 2000 }],
       [ORDER_D, 'booking_reversal',  { reversal_reason: 'timeout' }],
     ] as Array<[string, OfflineActionType, Record<string, unknown>]>) {
-      await queueOfflineTransaction(orderId, actionType, payload);
+      await queueOfflineTransaction(orderId, actionType, payload, DEVICE_SECRET);
     }
 
     const { probe } = makeControllableProbe();
@@ -413,8 +427,8 @@ describe('Phase 3 Ã¢â‚¬â€ connectivity: sms_only', () => {
     await initDatabase();
 
     // Seed exactly the two entries needed for SMS path testing.
-    await queueOfflineTransaction(ORDER_E, 'order_status_update', { status: 'in_trip' });
-    await queueOfflineTransaction(ORDER_F, 'dispatch_offer_response', { accepted: true, bid_amount_minor: 3800 });
+    await queueOfflineTransaction(ORDER_E, 'order_status_update', { status: 'in_trip' }, DEVICE_SECRET);
+    await queueOfflineTransaction(ORDER_F, 'dispatch_offer_response', { accepted: true, bid_amount_minor: 3800 }, DEVICE_SECRET);
 
     // Manually pre-advance entry F to attempt_count = 4 so one SMS failure
     // hits the MAX_RETRY_ATTEMPTS ceiling of 5 and triggers permanent failure.
@@ -510,6 +524,7 @@ describe('processOfflineQueue() re-entrant guard', () => {
       'aaaa1234-0000-4000-8000-000000000099',
       'order_status_update',
       { status: 'assigned' },
+      DEVICE_SECRET,
     );
 
     // Use a Promise whose resolve function we capture so we can release it
@@ -559,8 +574,8 @@ describe('Sprint 4 verification log', () => {
     await initDatabase();
 
     // Seed one representative entry per significant path to populate the log.
-    await queueOfflineTransaction(ORDER_C, 'booking_lock', { currency_code: 'USD', fare_minor: 3800, driver_share_bps: 8000, kona_commission_bps: 2000, escrow_timeout_at: 1765000000000 });
-    await queueOfflineTransaction(ORDER_E, 'order_status_update', { status: 'in_trip' });
+    await queueOfflineTransaction(ORDER_C, 'booking_lock', { currency_code: 'USD', fare_minor: 3800, driver_share_bps: 8000, kona_commission_bps: 2000, escrow_timeout_at: 1765000000000 }, DEVICE_SECRET);
+    await queueOfflineTransaction(ORDER_E, 'order_status_update', { status: 'in_trip' }, DEVICE_SECRET);
 
     const controlled = makeControllableProbe();
     controlled.setState('internet');

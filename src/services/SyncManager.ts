@@ -245,6 +245,11 @@ export class SyncManager {
     this.monitorIntervalHandle = setInterval(() => {
       void this.checkConnectivityAndTrigger();
     }, this.monitorIntervalMs);
+
+    // Allow the Node.js event loop to exit even when this interval is active.
+    // Without .unref(), a running monitor prevents Jest workers from exiting
+    // cleanly after tests complete.
+    (this.monitorIntervalHandle as unknown as { unref(): void }).unref();
   }
 
   /**
@@ -804,6 +809,7 @@ export async function runSprint4Verification(): Promise<void> {
       raw_payload: { currency_code: 'USD', fare_minor: 4500, driver_share_bps: 8000, kona_commission_bps: 2000, escrow_timeout_at: 1765000000000 },
       created_at: Date.now(), attempt_count: 0, last_attempt_at: null,
       synced_at: null, sync_status: 'pending',
+       previous_row_hash: 'GENESIS_BLOCK_ANCHOR_00000000', row_signature: 'MOCK_SIG_A',
     },
     {
       id: 2, idempotency_key: 'ikey-B', order_id: ORDER_B,
@@ -811,6 +817,7 @@ export async function runSprint4Verification(): Promise<void> {
       raw_payload: { fare_minor: 4500, driver_share_bps: 8000, kona_commission_bps: 2000 },
       created_at: Date.now() + 1, attempt_count: 0, last_attempt_at: null,
       synced_at: null, sync_status: 'pending',
+       previous_row_hash: 'MOCK_SIG_A', row_signature: 'MOCK_SIG_B',
     },
     {
       id: 3, idempotency_key: 'ikey-C', order_id: ORDER_C,
@@ -818,6 +825,7 @@ export async function runSprint4Verification(): Promise<void> {
       raw_payload: { currency_code: 'USD', fare_minor: 3800, driver_share_bps: 8000, kona_commission_bps: 2000, escrow_timeout_at: 1765000000000 },
       created_at: Date.now() + 2, attempt_count: 0, last_attempt_at: null,
       synced_at: null, sync_status: 'pending',
+       previous_row_hash: 'MOCK_SIG_B', row_signature: 'MOCK_SIG_C',
     },
     {
       id: 4, idempotency_key: 'ikey-D', order_id: ORDER_D,
@@ -825,6 +833,7 @@ export async function runSprint4Verification(): Promise<void> {
       raw_payload: { reversal_reason: 'timeout' },
       created_at: Date.now() + 3, attempt_count: 0, last_attempt_at: null,
       synced_at: null, sync_status: 'pending',
+       previous_row_hash: 'MOCK_SIG_C', row_signature: 'MOCK_SIG_D',
     },
     {
       id: 5, idempotency_key: 'ikey-E', order_id: ORDER_E,
@@ -832,6 +841,7 @@ export async function runSprint4Verification(): Promise<void> {
       raw_payload: { status: 'in_trip' },
       created_at: Date.now() + 4, attempt_count: 0, last_attempt_at: null,
       synced_at: null, sync_status: 'pending',
+       previous_row_hash: 'MOCK_SIG_D', row_signature: 'MOCK_SIG_E',
     },
     {
       // Entry F starts with 4 prior attempts so one more failure hits the ceiling.
@@ -840,6 +850,7 @@ export async function runSprint4Verification(): Promise<void> {
       raw_payload: { accepted: true, bid_amount_minor: 3800 },
       created_at: Date.now() + 5, attempt_count: 4, last_attempt_at: Date.now() - 60_000,
       synced_at: null, sync_status: 'pending',
+       previous_row_hash: 'MOCK_SIG_E', row_signature: 'MOCK_SIG_F',
     },
   ];
 

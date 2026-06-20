@@ -1,4 +1,5 @@
 import * as SQLite from 'expo-sqlite';
+import { LocalLedgerGuard } from './LocalLedgerGuard';
 
 export interface SyncQueueRow {
   id: number;
@@ -8,6 +9,8 @@ export interface SyncQueueRow {
   status: 'PENDING' | 'TRANSMITTING' | 'FAILED_BACKOFF';
   attempt_count: number;
   last_attempt_at: number | null;
+  previous_row_hash: string | null;
+  row_signature: string | null;
 }
 
 export class SQLiteSyncRepository {
@@ -22,7 +25,7 @@ export class SQLiteSyncRepository {
     // Open database instance file asynchronously
     this.db = await SQLite.openDatabaseAsync('kona_offline_cache.db');
 
-    // Establish the persistent sync pipeline schema layout
+    // Establish the persistent sync pipeline schema layout with cryptographic ledger columns
     await this.db.execAsync(`
       PRAGMA foreign_keys = ON;
       CREATE TABLE IF NOT EXISTS pending_sync_queue (
@@ -32,7 +35,9 @@ export class SQLiteSyncRepository {
         payload TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'PENDING',
         attempt_count INTEGER NOT NULL DEFAULT 0,
-        last_attempt_at INTEGER
+        last_attempt_at INTEGER,
+        previous_row_hash TEXT,
+        row_signature TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_queue_status_attempts 
       ON pending_sync_queue (status, last_attempt_at);
@@ -42,20 +47,48 @@ export class SQLiteSyncRepository {
   }
 
   /**
-   * Safe transaction entry insertion using structural constraints to block duplicates
+   * Safe transaction entry insertion with cryptographic chain verification.
+   * Computes sequential row hash linking current payload to previous row's signature.
+   * 
+   * @param entry The sync queue entry to append
+   * @param deviceSecret The device's HMAC secret for chain computation (optional, for ledger integrity)
+   * @returns true if insertion succeeded, false if idempotency blocked it
    */
-  public static async enqueue(entry: {
-    idempotencyKey: string;
-    actionType: string;
-    payload: Record<string, unknown>;
-  }): Promise<boolean> {
+  public static async enqueue(
+    entry: {
+      idempotencyKey: string;
+      actionType: string;
+      payload: Record<string, unknown>;
+    },
+    deviceSecret?: string
+  ): Promise<boolean> {
     const database = await this.initialize();
     const serializedPayload = JSON.stringify(entry.payload);
 
     try {
+      // Retrieve last row's signature to form the chain link
+      let previousRowHash = 'GENESIS_BLOCK_ANCHOR_00000000';
+      let rowSignature: string | null = null;
+
+      if (deviceSecret) {
+        // Fetch the signature of the last inserted row
+        previousRowHash = await LocalLedgerGuard.getLastRowSignature(
+          database,
+          'pending_sync_queue'
+        );
+
+        // Compute current row's chain signature binding payload to previous hash
+        rowSignature = await LocalLedgerGuard.computeChainHash(
+          serializedPayload,
+          previousRowHash,
+          deviceSecret
+        );
+      }
+
       await database.runAsync(
-        `INSERT INTO pending_sync_queue (idempotency_key, action_type, payload) VALUES (?, ?, ?)`,
-        [entry.idempotencyKey, entry.actionType, serializedPayload]
+        `INSERT INTO pending_sync_queue (idempotency_key, action_type, payload, previous_row_hash, row_signature) 
+         VALUES (?, ?, ?, ?, ?)`,
+        [entry.idempotencyKey, entry.actionType, serializedPayload, previousRowHash, rowSignature]
       );
       return true;
     } catch (error) {
@@ -95,5 +128,17 @@ export class SQLiteSyncRepository {
   public static async dequeue(id: number): Promise<void> {
     const database = await this.initialize();
     await database.runAsync(`DELETE FROM pending_sync_queue WHERE id = ?`, [id]);
+  }
+
+  /**
+   * Audits the entire pending_sync_queue table for cryptographic chain integrity.
+   * Used to detect if the local database has been tampered with at rest.
+   * 
+   * @param deviceSecret The device's HMAC secret for chain verification
+   * @returns true if the entire queue ledger is pristine and untampered, false otherwise
+   */
+  public static async verifyQueueIntegrity(deviceSecret: string): Promise<boolean> {
+    const database = await this.initialize();
+    return await LocalLedgerGuard.verifyTableIntegrity(database, 'pending_sync_queue', deviceSecret);
   }
 }
