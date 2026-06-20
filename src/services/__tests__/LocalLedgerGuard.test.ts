@@ -349,6 +349,39 @@ describe('LocalLedgerGuard - Cryptographic Ledger Chain', () => {
       );
       expect(isValid).toBe(false);
     });
+
+    it('should detect ID gaps in the chain sequence', async () => {
+      const { db, store } = createMockDatabase();
+
+      let previousHash = 'GENESIS_BLOCK_ANCHOR_00000000';
+      const payloads = ['payload_1', 'payload_2', 'payload_3'];
+
+      for (const payload of payloads) {
+        const sig = await LocalLedgerGuard.computeChainHash(
+          payload,
+          previousHash,
+          DEVICE_SECRET
+        );
+
+        await db.runAsync(
+          `INSERT INTO ${TEST_TABLE} (payload, previous_row_hash, row_signature) 
+           VALUES (?, ?, ?)`,
+          [payload, previousHash, sig]
+        );
+
+        previousHash = sig;
+      }
+
+      // Simulate deletion of historical row id=2, leaving IDs [1, 3].
+      store.splice(1, 1);
+
+      const isValid = await LocalLedgerGuard.verifyTableIntegrity(
+        db,
+        TEST_TABLE,
+        DEVICE_SECRET
+      );
+      expect(isValid).toBe(false);
+    });
   });
 
   // ===========================================================================

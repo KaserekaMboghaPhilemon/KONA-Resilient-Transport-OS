@@ -217,6 +217,11 @@ export async function queueOfflineTransaction(
       '[queueOfflineTransaction] actionType must be a valid OfflineActionType.',
     );
   }
+  if (typeof deviceSecret !== 'string' || deviceSecret.trim().length === 0) {
+    throw new TypeError(
+      '[queueOfflineTransaction] deviceSecret must be a non-empty string.',
+    );
+  }
 
   const db = requireDatabase();
   const idempotencyKey = await deriveIdempotencyKey(orderId, actionType, payload);

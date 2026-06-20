@@ -9,8 +9,8 @@ export interface SyncQueueRow {
   status: 'PENDING' | 'TRANSMITTING' | 'FAILED_BACKOFF';
   attempt_count: number;
   last_attempt_at: number | null;
-  previous_row_hash: string | null;
-  row_signature: string | null;
+  previous_row_hash: string;
+  row_signature: string;
 }
 
 export class SQLiteSyncRepository {
@@ -36,8 +36,8 @@ export class SQLiteSyncRepository {
         status TEXT NOT NULL DEFAULT 'PENDING',
         attempt_count INTEGER NOT NULL DEFAULT 0,
         last_attempt_at INTEGER,
-        previous_row_hash TEXT,
-        row_signature TEXT
+        previous_row_hash TEXT NOT NULL DEFAULT 'GENESIS_BLOCK_ANCHOR_00000000',
+        row_signature TEXT NOT NULL DEFAULT ''
       );
       CREATE INDEX IF NOT EXISTS idx_queue_status_attempts 
       ON pending_sync_queue (status, last_attempt_at);
@@ -51,7 +51,7 @@ export class SQLiteSyncRepository {
    * Computes sequential row hash linking current payload to previous row's signature.
    * 
    * @param entry The sync queue entry to append
-   * @param deviceSecret The device's HMAC secret for chain computation (optional, for ledger integrity)
+   * @param deviceSecret The device's HMAC secret for chain computation
    * @returns true if insertion succeeded, false if idempotency blocked it
    */
   public static async enqueue(
@@ -60,30 +60,29 @@ export class SQLiteSyncRepository {
       actionType: string;
       payload: Record<string, unknown>;
     },
-    deviceSecret?: string
+    deviceSecret: string
   ): Promise<boolean> {
+    const normalizedSecret = deviceSecret.trim();
+    if (!normalizedSecret) {
+      throw new Error('[KONA SQLite] deviceSecret is required to enqueue signed ledger rows.');
+    }
+
     const database = await this.initialize();
     const serializedPayload = JSON.stringify(entry.payload);
 
     try {
       // Retrieve last row's signature to form the chain link
-      let previousRowHash = 'GENESIS_BLOCK_ANCHOR_00000000';
-      let rowSignature: string | null = null;
+      const previousRowHash = await LocalLedgerGuard.getLastRowSignature(
+        database,
+        'pending_sync_queue'
+      );
 
-      if (deviceSecret) {
-        // Fetch the signature of the last inserted row
-        previousRowHash = await LocalLedgerGuard.getLastRowSignature(
-          database,
-          'pending_sync_queue'
-        );
-
-        // Compute current row's chain signature binding payload to previous hash
-        rowSignature = await LocalLedgerGuard.computeChainHash(
-          serializedPayload,
-          previousRowHash,
-          deviceSecret
-        );
-      }
+      // Compute current row's chain signature binding payload to previous hash
+      const rowSignature = await LocalLedgerGuard.computeChainHash(
+        serializedPayload,
+        previousRowHash,
+        normalizedSecret
+      );
 
       await database.runAsync(
         `INSERT INTO pending_sync_queue (idempotency_key, action_type, payload, previous_row_hash, row_signature) 
