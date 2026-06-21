@@ -49,6 +49,10 @@ import type {
 } from '../services/SyncManager';
 import { SyncManager } from '../services/SyncManager';
 import { TelemetrySyncManager } from '../services/TelemetrySyncManager';
+import {
+  StateCoordinator,
+} from '../services/StateCoordinator';
+import { useCoordinatorState } from '../hooks/useCoordinatorState';
 
 import * as Haptics from 'expo-haptics';
 
@@ -82,6 +86,7 @@ const ALARM_WARNING_DELAY_MS = 120_000; // 2 minutes
  * Override via the autoSyncDelayMs prop in tests (pass 0).
  */
 const AUTO_SYNC_DELAY_MS = 180_000; // 3 minutes
+const DEFAULT_COORDINATOR_TRIP_ID = 'GLOBAL_DRIVER_SYNC_STREAM';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Design tokens
@@ -753,6 +758,16 @@ export default function DriverSyncDashboard({
   autoSyncDelayMs,
   tripId               = null,
 }: DriverSyncDashboardProps) {
+  const coordinatorSnapshot = useCoordinatorState();
+  const isMountedRef = useRef(true);
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
+
   // Live connectivity state — polled from the injected probe.
   const connectivityState = useConnectivity(connectivityProbe);
 
@@ -772,6 +787,26 @@ export default function DriverSyncDashboard({
 
   // Telemetry flush state (Sprint 10).
   const [isTelemetryFlushing, setIsTelemetryFlushing] = useState(false);
+
+  useEffect(() => {
+    StateCoordinator.configure({
+      runQueueSync: async () => {
+        const report = await syncManager.processOfflineQueue();
+        if (!isMountedRef.current) {
+          return;
+        }
+        setLastReport(report);
+        setRefreshTrigger((t) => t + 1);
+      },
+      runTelemetrySync: async (coordinatorTripId: string) => {
+        await TelemetrySyncManager.forceTelemetrySync(coordinatorTripId);
+      },
+      haltOutboundTransports: () => {
+        syncManager.stopConnectivityMonitor();
+        TelemetrySyncManager.stopPeriodicSync();
+      },
+    });
+  }, [syncManager]);
 
   // Derived counts for the metric card pills.
   const { freshCount, retryingCount } = useMemo(() => ({
@@ -802,23 +837,30 @@ export default function DriverSyncDashboard({
 
   const handleForceSync = useCallback(async () => {
     if (isSyncing) return;
+
+    const coordinatorTripId =
+      (tripId ?? '').trim() || DEFAULT_COORDINATOR_TRIP_ID;
+
     animatePress();
     setIsSyncing(true);
     setSyncError(null);
     try {
-      const report = await syncManager.processOfflineQueue();
-      setLastReport(report);
-      setRefreshTrigger(t => t + 1);
+      await StateCoordinator.syncAllSystems(coordinatorTripId);
     } catch (err) {
+      if (!isMountedRef.current) {
+        return;
+      }
       setSyncError(
         err instanceof Error
           ? err.message
           : 'Sync encountered an unexpected error.',
       );
     } finally {
-      setIsSyncing(false);
+      if (isMountedRef.current) {
+        setIsSyncing(false);
+      }
     }
-  }, [isSyncing, syncManager, animatePress]);
+  }, [isSyncing, tripId, animatePress]);
 
   /**
    * Sprint 10: Manual telemetry flush handler.
@@ -827,16 +869,44 @@ export default function DriverSyncDashboard({
    */
   const handleTelemetryFlush = useCallback(async () => {
     if (isTelemetryFlushing || !tripId) return;
+
     setIsTelemetryFlushing(true);
+
     try {
-      await TelemetrySyncManager.forceTelemetrySync(tripId);
+      await StateCoordinator.syncAllSystems(tripId);
       console.log('[DriverSyncDashboard] Telemetry flush completed successfully.');
     } catch (error) {
+      if (!isMountedRef.current) {
+        return;
+      }
       console.error('[DriverSyncDashboard] Telemetry flush failed:', error);
     } finally {
-      setIsTelemetryFlushing(false);
+      if (isMountedRef.current) {
+        setIsTelemetryFlushing(false);
+      }
     }
   }, [isTelemetryFlushing, tripId]);
+
+  if (coordinatorSnapshot.status === 'LEDGER_COMPROMISED_LOCK') {
+    return (
+      <View style={styles.compromisedOverlay}>
+        <Text style={styles.compromisedTitle}>
+          CRITICAL SECURITY WARNING: LOCAL LEDGER COMPROMISED
+        </Text>
+        <Text style={styles.compromisedBody}>
+          The internal secure cryptographic audit trail on this device has
+          detected an unauthorized record mutation or ID sequence gap.
+        </Text>
+        <Text style={styles.compromisedLockLabel}>
+          ALL OUTBOUND TRANSPORT SYNCHRONIZATION IS LOCKED
+        </Text>
+        <Text style={styles.compromisedBody}>
+          Please contact KONA Fleet Operations to run a remote cryptographic
+          audit sweep and clear this device ledger.
+        </Text>
+      </View>
+    );
+  }
 
   // ── Alarm & auto-sync deferral ────────────────────────────────────────────
   // When the driver has unsynced entries and loses all connectivity, two
@@ -1042,6 +1112,38 @@ export default function DriverSyncDashboard({
 // ─────────────────────────────────────────────────────────────────────────────
 
 const styles = StyleSheet.create({
+  compromisedOverlay: {
+    flex: 1,
+    backgroundColor: '#21090A',
+    borderWidth: 2,
+    borderColor: '#EF4444',
+    margin: SPACING.lg,
+    borderRadius: RADIUS.lg,
+    padding: SPACING.xl,
+    justifyContent: 'center',
+    gap: SPACING.lg,
+  },
+  compromisedTitle: {
+    color: '#FCA5A5',
+    fontSize: 18,
+    lineHeight: 24,
+    fontWeight: '800',
+    textTransform: 'uppercase',
+  },
+  compromisedBody: {
+    color: PALETTE.textPrimary,
+    fontSize: 14,
+    lineHeight: 22,
+    fontWeight: '500',
+  },
+  compromisedLockLabel: {
+    color: '#F87171',
+    fontSize: 15,
+    lineHeight: 22,
+    fontWeight: '800',
+    textTransform: 'uppercase',
+  },
+
   // ── Root layout ────────────────────────────────────────────────────────────
   container: {
     flex:            1,

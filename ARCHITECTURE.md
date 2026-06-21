@@ -1,20 +1,25 @@
 # KONA Project Architecture — Complete Technical Specification
 
-**Last Updated:** 2026-06-17  
-**Project State:** Sprint 7 Complete — All 162 tests passing ✓  
-**Git Status:** All work committed to origin/main
+**Last Updated:** 2026-06-21  
+**Project State:** Sprint 15 Complete — Server-Side Ledger Reconciliation & Remote Audit Sweeps  
+**Test Status:** 15 test suites, 244 tests passing ✓  
+**TypeScript:** Strict mode, EXIT:0  
+**Git Status:** Ready for commit
 
 ---
 
 ## 1. Project Overview
 
-**KONA** is an offline sync and SMS transport architecture for a React Native driver app. It bridges unreliable mobile connectivity by enabling:
+**KONA** is an offline sync and SMS transport architecture for a React Native driver app with server-side cryptographic ledger reconciliation. It bridges unreliable mobile connectivity by enabling:
 
 1. **Offline-first queuing** — Actions accumulated locally when offline
 2. **Adaptive dual-path transmission** — HTTPS when online, SMS when sms_only, skip when neither
 3. **Multi-frame SMS reassembly** — Base45-encoded payloads split across SMS segments
 4. **Idempotency defense** — Deduplicate retries via transaction keys
 5. **Offline map tile caching** — Web Mercator pre-fetched tiles for rendering without internet
+6. **Local cryptographic ledger** — Device-side chain with HMAC signatures for data integrity verification
+7. **Server-side reconciliation** — Remote verification of incoming chains with gap/tampering detection
+8. **Administrative audit sweeps** — Secure token-based device unlock after investigation
 
 **Core Constraint:** TypeScript strict mode (tsconfig.json: `strict: true`)
 

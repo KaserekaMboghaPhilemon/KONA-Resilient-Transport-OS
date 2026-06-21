@@ -5,7 +5,7 @@
   "description": "KONA Sprint 2 Edge-State SQLite Local Node Cache",
   "main": "src/db/LocalDatabase.ts",
   "scripts": {
-    "test": "jest --verbose"
+    "test": "jest --verbose --forceExit"
   },
   "dependencies": {
     "@noble/hashes": "^2.2.0",

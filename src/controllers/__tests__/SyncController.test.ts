@@ -13,6 +13,15 @@
  */
 
 // Mock dependencies before importing the module under test
+// knex must be mocked first: all three repositories import it at module level,
+// and jest.mock without a factory still loads the real module to build the
+// automock. Without this stub the real pg connection pool is created, keeping
+// the Node.js event loop alive after the suite and causing Jest to hang.
+jest.mock('../../database/knex', () => ({
+  knex: Object.assign(jest.fn().mockReturnValue({ where: jest.fn(), insert: jest.fn(), update: jest.fn(), select: jest.fn() }), {
+    transaction: jest.fn(),
+  }),
+}));
 jest.mock('../../repositories/IdempotencyRepository');
 jest.mock('../../repositories/TripRepository');
 jest.mock('../../repositories/DriverSecretRepository');

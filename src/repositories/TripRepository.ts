@@ -79,4 +79,17 @@ export class TripRepository {
       return [];
     }
   }
+
+  public static async flagDriverForAudit(
+    driverId: string,
+    reason: string = 'SUSPENDED_AUDIT',
+  ): Promise<void> {
+    await knex('driver_states')
+      .where({ driver_id: driverId })
+      .update({
+        availability_status: 'locked',
+        lockout_reason: reason,
+        updated_at: new Date(),
+      });
+  }
 }

@@ -226,6 +226,46 @@ jest.mock('../../services/TelemetrySyncManager', () => ({
   },
 }));
 
+jest.mock('../../hooks/useCoordinatorState', () => ({
+  useCoordinatorState: jest.fn(),
+}));
+
+jest.mock('../../services/StateCoordinator', () => {
+  let deps: {
+    runQueueSync?: (tripId: string) => Promise<void>;
+    runTelemetrySync?: (tripId: string) => Promise<void>;
+  } = {};
+
+  class MockLedgerCompromisedError extends Error {
+    constructor(message: string) {
+      super(message);
+      this.name = 'LedgerCompromisedError';
+    }
+  }
+
+  return {
+    LedgerCompromisedError: MockLedgerCompromisedError,
+    StateCoordinator: {
+      configure: jest.fn((params: {
+        runQueueSync?: (tripId: string) => Promise<void>;
+        runTelemetrySync?: (tripId: string) => Promise<void>;
+      }) => {
+        deps = { ...deps, ...params };
+      }),
+      syncAllSystems: jest.fn(async (tripId: string) => {
+        if (deps.runQueueSync) {
+          await deps.runQueueSync(tripId);
+        }
+        if (deps.runTelemetrySync) {
+          await deps.runTelemetrySync(tripId);
+        }
+      }),
+      subscribe: jest.fn(() => () => undefined),
+      getSnapshot: jest.fn(() => ({})),
+    },
+  };
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Imports — after mocks
 // ─────────────────────────────────────────────────────────────────────────────
@@ -241,8 +281,34 @@ import DriverSyncDashboard, {
 import type { ConnectivityProbe, ConnectivityState } from '../../services/SyncManager';
 import { SyncManager } from '../../services/SyncManager';
 import { TelemetrySyncManager } from '../../services/TelemetrySyncManager';
+import { useCoordinatorState } from '../../hooks/useCoordinatorState';
+import { StateCoordinator } from '../../services/StateCoordinator';
 import type { QueueEntry } from '../../db/LocalDatabase';
 import type { QueueProcessingReport } from '../../services/SyncManager';
+import type { CoordinatorSnapshot } from '../../services/StateCoordinator';
+
+const mockUseCoordinatorState = useCoordinatorState as jest.MockedFunction<
+  typeof useCoordinatorState
+>;
+const mockStateCoordinator = StateCoordinator as jest.Mocked<typeof StateCoordinator>;
+
+function makeCoordinatorSnapshot(
+  overrides: Partial<CoordinatorSnapshot> = {},
+): CoordinatorSnapshot {
+  return {
+    status: 'IDLE',
+    isProcessing: false,
+    activeTripId: null,
+    ledgerIntegrityOk: null,
+    lastError: null,
+    lastRunStartedAt: null,
+    lastRunFinishedAt: null,
+    successfulRuns: 0,
+    failedRuns: 0,
+    skippedRuns: 0,
+    ...overrides,
+  };
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helper: flush pending promises so async polling useEffects settle.
@@ -334,6 +400,11 @@ const NEAR_MAX_ENTRY: QueueEntry = MOCK_PREVIEW_ENTRIES[4]; // driver_location_u
 // when the component unmounts.
 // ─────────────────────────────────────────────────────────────────────────────
 
+beforeEach(() => {
+  process.env.KONA_DEVICE_SECRET = 'TEST_COORDINATOR_DEVICE_SECRET';
+  mockUseCoordinatorState.mockReturnValue(makeCoordinatorSnapshot());
+});
+
 afterEach(() => {
   jest.clearAllMocks();
 });
@@ -343,6 +414,30 @@ afterEach(() => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe('1 — Initial render states', () => {
+  it('mounts a blocking security warning layout when coordinator is compromised', async () => {
+    mockUseCoordinatorState.mockReturnValue(
+      makeCoordinatorSnapshot({ status: 'LEDGER_COMPROMISED_LOCK' }),
+    );
+
+    const { probe } = makeProbe('internet');
+    const { getByText, queryByText } = await render(
+      <DriverSyncDashboard
+        syncManager={makeMockSyncManager()}
+        connectivityProbe={probe}
+        getPendingEntries={async () => [FRESH_ENTRY]}
+      />,
+    );
+
+    expect(
+      getByText('CRITICAL SECURITY WARNING: LOCAL LEDGER COMPROMISED'),
+    ).toBeTruthy();
+    expect(
+      getByText('ALL OUTBOUND TRANSPORT SYNCHRONIZATION IS LOCKED'),
+    ).toBeTruthy();
+    expect(queryByText('FORCE SYNC NOW')).toBeNull();
+    expect(queryByText('PENDING SYNC QUEUE')).toBeNull();
+  });
+
   it('renders the brand name and screen title', async () => {
     const { probe }  = makeProbe('internet');
     const manager    = makeMockSyncManager();
@@ -722,6 +817,7 @@ describe('3 — Force Sync action execution', () => {
     await flushPromises();
 
     expect(manager.processOfflineQueue).toHaveBeenCalledTimes(1);
+    expect(mockStateCoordinator.syncAllSystems).toHaveBeenCalledTimes(1);
 
     // Clean up — resolve so the component can unmount without state updates.
     await act(async () => { resolveSync(makeReport()); await Promise.resolve(); });

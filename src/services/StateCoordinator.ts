@@ -22,6 +22,8 @@ export interface StateCoordinatorSnapshot {
   skippedRuns: number;
 }
 
+export type CoordinatorSnapshot = StateCoordinatorSnapshot;
+
 export type StateCoordinatorListener = (
   snapshot: Readonly<StateCoordinatorSnapshot>,
 ) => void;

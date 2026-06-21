@@ -79,6 +79,14 @@ describe('TelemetrySyncManager – Task 9.4 Periodic Daemon & Backoff', () => {
     jest.useRealTimers();
   });
 
+  // Belt-and-suspenders: ensure the static daemon is fully stopped and real
+  // timers are active after the entire suite so no scheduled cycle outlives
+  // this test file and triggers Jest's open-handle warning in the next suite.
+  afterAll(() => {
+    TelemetrySyncManager.stopPeriodicSync();
+    jest.useRealTimers();
+  });
+
   // -------------------------------------------------------------------------
   // computeBackoffDelay math
   // -------------------------------------------------------------------------

@@ -2,6 +2,11 @@ import { IdempotencyRepository } from '../repositories/IdempotencyRepository';
 import { TripRepository } from '../repositories/TripRepository';
 import { DriverSecretRepository } from '../repositories/DriverSecretRepository';
 import { CryptoSignatureEngine } from '../services/CryptoSignatureEngine';
+import {
+  IncomingLedgerRow,
+  ReconciliationErrorCode,
+  ServerLedgerReconciler,
+} from '../services/ServerLedgerReconciler';
 
 /**
  * Sprint 7.5 – SyncController: PostgreSQL transaction routing matrix
@@ -40,7 +45,103 @@ export class SignatureAuthenticationError extends Error {
   }
 }
 
+export class OfflineLedgerVerificationError extends Error {
+  public readonly breachType: ReconciliationErrorCode | 'BATCH_SIGNATURE_INVALID';
+
+  public readonly failedRowId?: number;
+
+  constructor(
+    breachType: ReconciliationErrorCode | 'BATCH_SIGNATURE_INVALID',
+    failedRowId?: number,
+  ) {
+    super(`[SyncController] Offline ledger verification failed: ${breachType}.`);
+    this.name = 'OfflineLedgerVerificationError';
+    this.breachType = breachType;
+    this.failedRowId = failedRowId;
+  }
+}
+
+export interface OfflineLedgerBatchInput {
+  driverId: string;
+  deviceId: string;
+  rows: IncomingLedgerRow[];
+  batchSignatureHex: string;
+  lastValidServerHash: string | null;
+}
+
+export interface OfflineLedgerIngestResult {
+  success: true;
+  acceptedRows: number;
+}
+
 export class SyncController {
+  public static async ingestOfflineLedgerBatch(
+    input: OfflineLedgerBatchInput,
+  ): Promise<OfflineLedgerIngestResult> {
+    const driverId = input.driverId.trim();
+    const deviceId = input.deviceId.trim();
+
+    if (!driverId) {
+      throw new TypeError('[SyncController] ingestOfflineLedgerBatch requires a non-empty driverId.');
+    }
+    if (!deviceId) {
+      throw new TypeError('[SyncController] ingestOfflineLedgerBatch requires a non-empty deviceId.');
+    }
+    if (!Array.isArray(input.rows)) {
+      throw new TypeError('[SyncController] ingestOfflineLedgerBatch requires rows[] array input.');
+    }
+
+    const deviceSecret = await DriverSecretRepository.getSecretByDriverId(driverId);
+    if (!deviceSecret) {
+      throw new SignatureAuthenticationError(
+        `[SyncController] No authentication secret registered for driver ${driverId}.`,
+      );
+    }
+
+    const validBatchSignature = ServerLedgerReconciler.verifyBatchSignature(
+      input.rows,
+      input.batchSignatureHex,
+      deviceSecret,
+      deviceId,
+    );
+    if (!validBatchSignature) {
+      await TripRepository.flagDriverForAudit(driverId, 'SUSPENDED_AUDIT:BATCH_SIGNATURE_INVALID');
+      throw new OfflineLedgerVerificationError('BATCH_SIGNATURE_INVALID');
+    }
+
+    const reconciliation = await ServerLedgerReconciler.verifyIncomingChain(
+      input.rows,
+      input.lastValidServerHash,
+      deviceSecret,
+    );
+
+    if (!reconciliation.success) {
+      const breachType = reconciliation.error ?? 'INVALID_SIGNATURE';
+      await TripRepository.flagDriverForAudit(driverId, `SUSPENDED_AUDIT:${breachType}`);
+      throw new OfflineLedgerVerificationError(
+        breachType,
+        reconciliation.failedRowId,
+      );
+    }
+
+    for (const row of input.rows) {
+      let decoded: unknown;
+      try {
+        decoded = JSON.parse(row.payload);
+      } catch {
+        throw new TypeError(
+          `[SyncController] Invalid JSON payload in incoming row ${row.id}.`,
+        );
+      }
+      await this.executeAction(decoded);
+    }
+
+    return {
+      success: true,
+      acceptedRows: input.rows.length,
+    };
+  }
+
   /**
    * Main entry point for processing verified, reassembled sync actions.
    * Handles idempotency defences and domain-specific routing.
