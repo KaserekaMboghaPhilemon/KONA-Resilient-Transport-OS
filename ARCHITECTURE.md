@@ -1,8 +1,8 @@
 # KONA Project Architecture — Complete Technical Specification
 
-**Last Updated:** 2026-06-21  
-**Project State:** Sprint 15 Complete — Server-Side Ledger Reconciliation & Remote Audit Sweeps  
-**Test Status:** 15 test suites, 244 tests passing ✓  
+**Last Updated:** 2026-09-18  
+**Project State:** Sprint 17 Complete — Stateful Gateway Buffering & Express App Bootstrap  
+**Test Status:** 16 test suites, 261 tests passing ✓  
 **TypeScript:** Strict mode, EXIT:0  
 **Git Status:** Ready for commit
 
@@ -20,6 +20,9 @@
 6. **Local cryptographic ledger** — Device-side chain with HMAC signatures for data integrity verification
 7. **Server-side reconciliation** — Remote verification of incoming chains with gap/tampering detection
 8. **Administrative audit sweeps** — Secure token-based device unlock after investigation
+9. **SMS wire encoding** — Compact positional serialization, multipart envelopes, and HMAC verification
+10. **Stateful gateway buffering** — Sender-bound, signature-aware frame accumulation with TTL cleanup
+11. **Express application bootstrap** — HTTP route composition for sync ingestion, SMS intake, and audit operations
 
 **Core Constraint:** TypeScript strict mode (tsconfig.json: `strict: true`)
 
@@ -32,15 +35,23 @@ src/
 ├── controllers/
 │   └── SyncController.ts              (240 lines) — Transaction routing matrix
 ├── routes/
-│   ├── smsIntake.ts                   (145 lines) — Express webhook endpoint
+│   ├── audit.ts                        — Administrative audit sweep endpoint
+│   ├── smsIntake.ts                   (145 lines) — Express SMS gateway webhook endpoint
+│   ├── sync.ts                         — Offline ledger batch ingestion endpoint
 │   └── __tests__/
-│       └── smsIntake.test.ts          (500+ lines) — Integration tests (19 tests)
+│       ├── audit.test.ts               — Audit endpoint integration tests
+│       ├── smsIntake.test.ts            (500+ lines) — Gateway integration tests
+│       └── sync.test.ts                 — Sync endpoint integration tests
 ├── services/
 │   ├── LocalDatabase.ts               (140 lines) — Payload decompression & sync tracking
 │   ├── SyncManager.ts                 (270 lines) — Offline queue processor, retry logic
 │   ├── SQLiteSyncRepository.ts        (165 lines) — Persistent sync state tracking
 │   ├── SMSTransportManager.ts         (130 lines) — Multi-frame SMS splitting
 │   ├── SMSReassemblyManager.ts        (125 lines) — Frame accumulation & Base45 decode
+│   ├── SMSWireEncoder.ts               — Compact SMS serialization and HMAC signing
+│   ├── StateCoordinator.ts             — Ledger preflight, sync serialization, and lock state
+│   ├── ServerLedgerReconciler.ts       — Server-side chain verification and audit tokens
+│   ├── AppInitializer.ts               — Crash recovery and lifecycle restoration
 │   ├── MapCacheManager.ts             (425 lines) — Web Mercator tile pre-fetching
 │   └── __tests__/
 │       ├── LocalDatabase.test.ts      (180 lines) — 20 tests
@@ -50,27 +61,33 @@ src/
 │       └── DriverSyncDashboard.test.ts (210 lines) — 22 tests
 ├── types/
 │   └── base45.d.ts                    (Ambient .d.ts for base45 v2.0.1)
-└── index.ts                           (Express app initialization)
+└── package.json                        (Dependencies, Jest configuration)
 
-package.json                           (Dependencies, jest config)
 tsconfig.json                          (Strict mode, ES2020 target, CommonJS)
 CONTEXT.md                             (Project scope)
 ARCHITECTURE.md                        (This file)
 ```
 
+### 2.1 Completed Sprint Status
+
+- **Sprint 15 — Server-Side Ledger Reconciliation & Remote Audit Sweeps:** Complete. Incoming ledger chains, batch signatures, administrative sweep signatures, and the `/clear-lock` route are implemented and test-covered.
+- **Sprint 16 — SMS Wire Encoder:** Complete. `SMSWireEncoder` provides compact positional encoding, multipart `KONA` envelopes, lossless decoding, and tamper/wrong-secret rejection.
+- **Sprint 17 — Stateful Gateway Buffering & Express App Bootstrap:** Complete. `SMSReassemblyManager` buffers frames by transaction ID, enforces sender and signature consistency, expires abandoned transmissions, and feeds decoded payloads into the controller. Express route modules expose sync ingestion, SMS gateway intake, and audit operations with integration coverage.
+- **Verification:** The full Jest run is green: **16 test suites, 261 tests passing**.
+
 ---
 
 ## 3. Technology Stack
 
-| Layer | Technology | Version | Purpose |
-|-------|-----------|---------|---------|
-| **HTTP Framework** | Express | 4.x | Webhook endpoint routing |
-| **Database (Device)** | expo-sqlite | v14.0.0 | LocalDatabase persistence |
-| **File System** | expo-file-system/legacy | v56.0.8 | Map tile cache I/O |
-| **Payload Encoding** | base45 | v2.0.1 | SMS compression (no native .d.ts) |
-| **Language** | TypeScript | v5.4.0 | Type safety, strict mode |
-| **Test Framework** | Jest | v29.7.0 | Unit + integration tests (3 projects) |
-| **HTTP Testing** | supertest + @types/supertest | Latest | Express integration tests |
+| Layer                 | Technology                   | Version | Purpose                               |
+| --------------------- | ---------------------------- | ------- | ------------------------------------- |
+| **HTTP Framework**    | Express                      | 4.x     | Webhook endpoint routing              |
+| **Database (Device)** | expo-sqlite                  | v14.0.0 | LocalDatabase persistence             |
+| **File System**       | expo-file-system/legacy      | v56.0.8 | Map tile cache I/O                    |
+| **Payload Encoding**  | base45                       | v2.0.1  | SMS compression (no native .d.ts)     |
+| **Language**          | TypeScript                   | v5.4.0  | Type safety, strict mode              |
+| **Test Framework**    | Jest                         | v29.7.0 | Unit + integration tests (3 projects) |
+| **HTTP Testing**      | supertest + @types/supertest | Latest  | Express integration tests             |
 
 ---
 
@@ -79,6 +96,7 @@ ARCHITECTURE.md                        (This file)
 ### 4.1 Dual-Layer Persistence
 
 **Problem:** Track both:
+
 - **Payload decompression state** (LocalDatabase: sync_status field)
 - **Transmission delivery state** (SQLiteSyncRepository: PENDING → TRANSMITTING → COMPLETED/FAILED_BACKOFF)
 
@@ -105,6 +123,7 @@ SQLiteSyncRepository:
 ```
 
 **Data Flow:**
+
 ```
 LocalDatabase.enqueue()
     ↓
@@ -125,8 +144,9 @@ SQLiteSyncRepository.updateStatus(..., 'FAILED_BACKOFF', attemptIncrement)
 **Problem:** Connectivity varies; need fallback from HTTPS to SMS, then skip if neither available.
 
 **Decision Logic:**
+
 ```
-const transmission_mode = 
+const transmission_mode =
   (hasInternet) ? 'HTTPS' :
   (sms_only)    ? 'SMS' :
   (skip)        ? 'SKIP' :
@@ -149,6 +169,7 @@ y = floor(n * (1 - ln(tan(latrad) + sec(latrad))/π) / 2)
 ```
 
 **Constraints:**
+
 - Latitude clamped to ±85.051129° (Web Mercator limit)
 - Zoom: [0, 22] (throw RangeError outside)
 - Y axis: 0 = north pole, increases southward
@@ -158,6 +179,7 @@ y = floor(n * (1 - ln(tan(latrad) + sec(latrad))/π) / 2)
 **Problem:** Payload may exceed SMS segment size (160 chars standard, 140 in 7-bit) → split across N frames.
 
 **Frame Format:**
+
 ```
 KONA:[TXID]:[N]/[T]:[DATA]
 
@@ -198,9 +220,12 @@ CLEANUP (every 15 min):
 **Defense Layers:**
 
 1. **SyncController.processedIdempotencyKeys Set** (in-memory, single-process):
+
    ```typescript
    if (this.processedIdempotencyKeys.has(idempotency_key)) {
-     console.warn(`Idempotency Hit! ${idempotency_key} already processed. Skipping.`);
+     console.warn(
+       `Idempotency Hit! ${idempotency_key} already processed. Skipping.`,
+     );
      return;
    }
    // ... execute ...
@@ -228,7 +253,7 @@ CLEANUP (every 15 min):
 ```typescript
 export interface KonaSyncAction {
   idempotency_key: string;
-  action_type: 'CREATE_TRIP' | 'START_RIDE' | 'UPDATE_FARE' | 'END_RIDE';
+  action_type: "CREATE_TRIP" | "START_RIDE" | "UPDATE_FARE" | "END_RIDE";
   payload: Record<string, unknown>;
 }
 
@@ -240,6 +265,7 @@ export class SyncController {
 **Key Features:**
 
 1. **Type Guard Validation:** Rejects malformed actions with TypeError
+
    ```
    [SyncController] Missing required field: "idempotency_key"
    ```
@@ -250,13 +276,23 @@ export class SyncController {
    - Prevents duplicate domain executions
 
 3. **Exhaustive Switch Routing:** 4 action types map to private handlers
+
    ```typescript
    switch (action_type) {
-     case 'CREATE_TRIP': await this.handleCreateTrip(payload); break;
-     case 'START_RIDE': await this.handleStartRide(payload); break;
-     case 'UPDATE_FARE': await this.handleUpdateFare(payload); break;
-     case 'END_RIDE': await this.handleEndRide(payload); break;
-     default: const exhaustiveCheck: never = action_type; // TS compile error
+     case "CREATE_TRIP":
+       await this.handleCreateTrip(payload);
+       break;
+     case "START_RIDE":
+       await this.handleStartRide(payload);
+       break;
+     case "UPDATE_FARE":
+       await this.handleUpdateFare(payload);
+       break;
+     case "END_RIDE":
+       await this.handleEndRide(payload);
+       break;
+     default:
+       const exhaustiveCheck: never = action_type; // TS compile error
    }
    ```
 
@@ -277,10 +313,11 @@ export class SyncController {
 **Endpoint:** `POST /api/v1/sms/gateway-webhook`
 
 **Field Normalization:** Handles both gateway conventions:
+
 ```typescript
 // Twilio: From (sender) + Body (message)
 // AT:     from (sender) + text (message)
-const sender = body.from || body.From;  // lowercase precedence
+const sender = body.from || body.From; // lowercase precedence
 const message = body.text || body.Body;
 ```
 
@@ -303,6 +340,7 @@ POST /api/v1/sms/gateway-webhook
 ```
 
 **HTTP Status Codes:**
+
 - `200 OK` — Action reassembled, decoded, routed to SyncController
 - `202 Accepted` — More frames pending (reassembly incomplete)
 - `400 Bad Request` — Missing sender or message body field
@@ -317,6 +355,7 @@ POST /api/v1/sms/gateway-webhook
 **Purpose:** Accumulate multi-frame SMS segments, reassemble Base45, decode JSON.
 
 **Static Cache Architecture:**
+
 ```typescript
 private static readonly cache = new Map<string, ReassemblyRecord>();
 
@@ -331,10 +370,11 @@ interface ReassemblyRecord {
 **Core Methods:**
 
 1. **processIncomingSegment(sender: string, rawBody: string): KonaSyncAction | null**
+
    ```
    Input:  "KONA:ABC1:1/2:H=AGAbIFf..." (frame 1 of 2)
    Output: null (incomplete)
-   
+
    Regex: /^KONA:([A-Z0-9]{4}):(\d+)\/(\d+):(.+)$/
    ├─ extract txId, frameNum, totalFrames, data
    ├─ validate frameNum ≤ totalFrames
@@ -344,6 +384,7 @@ interface ReassemblyRecord {
    ```
 
 2. **reassembleAndDecode(txId: string, record: ReassemblyRecord): KonaSyncAction**
+
    ```
    ├─ stitch frames in order (1 to totalFrames)
    ├─ concatenate DATA segments → wire string
@@ -364,6 +405,7 @@ interface ReassemblyRecord {
    ```
 
 **Spoof Protection Example:**
+
 ```
 Frame 1/2 from +254700000001 (TXID ABC1 registered)
 Frame 2/2 from +254700000002 (different sender)
@@ -373,6 +415,7 @@ Frame 2/2 from +254700000002 (different sender)
 ```
 
 **Error Handling:**
+
 - Invalid frame format (regex mismatch) → console.warn, return null
 - Base45 decode error → catch, log, return null
 - JSON parse error → catch, log, return null
@@ -454,6 +497,7 @@ if (attempt >= MAX_RETRY_ATTEMPTS) {
 ```
 
 **Backoff Calculation:**
+
 - Attempt 0: 2 seconds
 - Attempt 1: 4 seconds
 - Attempt 2: 8 seconds
@@ -489,20 +533,24 @@ CREATE TABLE IF NOT EXISTS pending_sync_queue (
    - No initialization data required
 
 2. **enqueue(idempotencyKey, actionType, payload): Promise<number>**
+
    ```
    INSERT INTO pending_sync_queue (...) VALUES (...)
    RETURNING id
    ```
+
    - Throws on duplicate idempotency_key (UNIQUE constraint)
 
 3. **getActiveQueue(): Promise<SyncQueueRow[]>**
+
    ```
-   SELECT * FROM pending_sync_queue 
+   SELECT * FROM pending_sync_queue
    WHERE status IN ('PENDING', 'FAILED_BACKOFF')
    ORDER BY created_at ASC
    ```
 
 4. **updateStatus(id, status, attemptIncrement): Promise<void>**
+
    ```
    UPDATE pending_sync_queue
    SET status = ?, attempt_count = attempt_count + ?, last_attempt_at = NOW()
@@ -538,6 +586,7 @@ return true;
 ```
 
 **Error Handling:**
+
 - Telecom gateway rejection (status 'cancelled', etc.) → throw
 - Partial frame delivery → log, continue (retry on next poll)
 - Network timeout → throw
@@ -551,22 +600,24 @@ return true;
 **Core Methods:**
 
 1. **latLngToTile(lat: number, lng: number, zoom: number): {x, y, z}**
+
    ```typescript
    // Web Mercator translation
    if (lat < -85.051129 || lat > 85.051129) throw new RangeError(...);
    if (zoom < 0 || zoom > 22) throw new RangeError(...);
-   
+
    const n = Math.pow(2, zoom);
    const x = Math.floor(n * (lng + 180) / 360);
    const latRad = (lat * Math.PI) / 180;
    const y = Math.floor(
      (n * (1 - Math.log(Math.tan(latRad) + 1/Math.cos(latRad))/Math.PI)) / 2
    );
-   
+
    return {x, y, z: zoom};
    ```
 
 2. **getBoundingBoxTiles(routePoints: [lat, lng][], zoom: number, paddingRadius = 1)**
+
    ```
    ├─ find minLat, maxLat, minLng, maxLng from route points
    ├─ expand by paddingRadius (default 1 tile)
@@ -576,18 +627,19 @@ return true;
    ```
 
 3. **prefetchRouteTiles(routePoints, options = {zoom: [13, 16]}): Promise<{downloaded, skipped, failed}**
+
    ```
    await this.initialize();  // create cache dir if needed
-   
+
    for each zoom in options.zoom:
      const tiles = this.getBoundingBoxTiles(routePoints, zoom, 1);
-     
+
      for each tile in tiles:
        if (await isTileCached(tile)) {
          skipped++;
          continue;
        }
-       
+
        try {
          await this.downloadTile(tile, tileServerUrl);
          downloaded++;
@@ -595,20 +647,22 @@ return true;
          failed++;
          log error, continue;  // do not interrupt batch
        }
-   
+
    return {downloaded, skipped, failed};
    ```
 
 4. **downloadTile(tile: {x, y, z}, tileServerUrl: string): Promise<void>**
+
    ```
    const url = tileServerUrl.replace(/{z}/g, z).replace(/{x}/g, x).replace(/{y}/g, y);
    const filePath = `${cacheDir}/kona_map_tiles/${z}/${x}/${y}.png`;
-   
+
    await FileSystem.makeDirectoryAsync(dirname(filePath), {intermediates: true});
    await FileSystem.downloadAsync(url, filePath, {headers: {}});
    ```
 
 **Cache Directory Structure:**
+
 ```
 {FileSystem.cacheDirectory}/
   kona_map_tiles/
@@ -625,6 +679,7 @@ return true;
 ```
 
 **Test Coverage:** 30 comprehensive tests including:
+
 - Web Mercator math validation (z=0, z=1, z=2 edge cases)
 - Bounding box expansion with padding
 - Cache hit/miss logic
@@ -638,6 +693,7 @@ return true;
 **Purpose:** Persistent local queue for actions pending sync.
 
 **Table Schema:**
+
 ```sql
 CREATE TABLE IF NOT EXISTS sync_queue (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -746,7 +802,7 @@ MapCacheManager.prefetchRouteTiles()
              │  └─ success: downloaded++
              │
              └─ on error: failed++, continue (no interruption)
-    
+
     return {downloaded, skipped, failed}
 ```
 
@@ -760,22 +816,22 @@ MapCacheManager.prefetchRouteTiles()
 // KonaSyncAction — Canonical shape post-reassembly
 export interface KonaSyncAction {
   idempotency_key: string;
-  action_type: 'CREATE_TRIP' | 'START_RIDE' | 'UPDATE_FARE' | 'END_RIDE';
+  action_type: "CREATE_TRIP" | "START_RIDE" | "UPDATE_FARE" | "END_RIDE";
   payload: Record<string, unknown>;
 }
 
 // Domain payloads (examples, extensible)
 interface CreateTripPayload {
   driver_id: string;
-  origin: {lat: number, lng: number};
-  destination: {lat: number, lng: number};
+  origin: { lat: number; lng: number };
+  destination: { lat: number; lng: number };
   order_id: string;
 }
 
 interface StartRidePayload {
   trip_id: string;
   timestamp: number;
-  driver_location: {lat: number, lng: number};
+  driver_location: { lat: number; lng: number };
 }
 
 interface UpdateFarePayload {
@@ -799,7 +855,7 @@ interface LocalDatabaseRow {
   order_id: string;
   action_type: string;
   payload: Record<string, unknown>;
-  sync_status: 'PENDING' | 'SYNCED' | 'ERROR';
+  sync_status: "PENDING" | "SYNCED" | "ERROR";
   created_at: string;
 }
 
@@ -808,7 +864,7 @@ interface SyncQueueRow {
   idempotency_key: string;
   action_type: string;
   payload: Record<string, unknown>;
-  status: 'PENDING' | 'TRANSMITTING' | 'FAILED_BACKOFF';
+  status: "PENDING" | "TRANSMITTING" | "FAILED_BACKOFF";
   attempt_count: number;
   last_attempt_at: string | null;
   created_at: string;
@@ -914,7 +970,7 @@ SyncManager.handleTransmissionFailure(row: SyncQueueRow, error: Error): Promise<
 // Layer 1: In-memory Set (SyncController)
 if (processedIdempotencyKeys.has(key)) {
   console.warn(`Idempotency Hit! ${key} already processed. Skipping.`);
-  return;  // early exit, no handler execution
+  return; // early exit, no handler execution
 }
 
 // Layer 2: Database UNIQUE constraint (SQLiteSyncRepository.enqueue)
@@ -951,49 +1007,60 @@ if (processedIdempotencyKeys.has(key)) {
 
 ### 9.2 Service Test Coverage (162 tests total)
 
-| Suite | Tests | Key Vectors |
-|-------|-------|-------------|
-| LocalDatabase | 20 | enqueue, getQueue, updateStatus, database persistence |
-| SyncManager | 30 | processOfflineQueue, HTTPS/SMS fallback, backoff calculation, retry limits |
-| SMSTransportManager | 45 | frame splitting, multi-chunk dispatch, error handling |
-| MapCacheManager | 30 | Web Mercator math, bounding box expansion, cache I/O, network errors |
-| DriverSyncDashboard | 22 | UI state, retry display, progress tracking |
-| smsIntake | 19 | field normalization, frame reassembly, idempotency, TTL cleanup, error handling |
-| **TOTAL** | **162** | Full integration coverage, edge cases, fault injection |
+| Suite               | Tests   | Key Vectors                                                                     |
+| ------------------- | ------- | ------------------------------------------------------------------------------- |
+| LocalDatabase       | 20      | enqueue, getQueue, updateStatus, database persistence                           |
+| SyncManager         | 30      | processOfflineQueue, HTTPS/SMS fallback, backoff calculation, retry limits      |
+| SMSTransportManager | 45      | frame splitting, multi-chunk dispatch, error handling                           |
+| MapCacheManager     | 30      | Web Mercator math, bounding box expansion, cache I/O, network errors            |
+| DriverSyncDashboard | 22      | UI state, retry display, progress tracking                                      |
+| smsIntake           | 19      | field normalization, frame reassembly, idempotency, TTL cleanup, error handling |
+| **TOTAL**           | **162** | Full integration coverage, edge cases, fault injection                          |
 
 ### 9.3 Key Test Patterns
 
 #### Pattern 1: Type Guard Validation (SyncController)
+
 ```typescript
-test('throws TypeError when idempotency_key is missing', () => {
-  expect(() => SyncController.executeAction({
-    action_type: 'CREATE_TRIP',
-    payload: {}
-  })).toThrow(TypeError);
+test("throws TypeError when idempotency_key is missing", () => {
+  expect(() =>
+    SyncController.executeAction({
+      action_type: "CREATE_TRIP",
+      payload: {},
+    }),
+  ).toThrow(TypeError);
 });
 ```
 
 #### Pattern 2: Idempotency Defense (SyncController)
+
 ```typescript
-test('skips duplicate idempotency_key silently', async () => {
-  const action = {idempotency_key: 'key1', action_type: 'CREATE_TRIP', payload: {}};
+test("skips duplicate idempotency_key silently", async () => {
+  const action = {
+    idempotency_key: "key1",
+    action_type: "CREATE_TRIP",
+    payload: {},
+  };
   await SyncController.executeAction(action);
-  await SyncController.executeAction(action);  // second call
+  await SyncController.executeAction(action); // second call
   // verify handler called exactly once
 });
 ```
 
 #### Pattern 3: Multi-Frame Reassembly (smsIntake)
+
 ```typescript
-test('stitches two raw DATA chunks and decodes JSON correctly', async () => {
-  const txId = 'TEST';
-  const part1 = await request(app).post('/api/v1/sms/gateway-webhook').send({
-    From: '+254700000001', Body: 'KONA:TEST:1/2:H=AGAB...'
+test("stitches two raw DATA chunks and decodes JSON correctly", async () => {
+  const txId = "TEST";
+  const part1 = await request(app).post("/api/v1/sms/gateway-webhook").send({
+    From: "+254700000001",
+    Body: "KONA:TEST:1/2:H=AGAB...",
   });
   expect(part1.status).toBe(202);
-  
-  const part2 = await request(app).post('/api/v1/sms/gateway-webhook').send({
-    From: '+254700000001', Body: 'KONA:TEST:2/2:eIGJF...'
+
+  const part2 = await request(app).post("/api/v1/sms/gateway-webhook").send({
+    From: "+254700000001",
+    Body: "KONA:TEST:2/2:eIGJF...",
   });
   expect(part2.status).toBe(200);
   // verify original payload reconstructed
@@ -1001,24 +1068,26 @@ test('stitches two raw DATA chunks and decodes JSON correctly', async () => {
 ```
 
 #### Pattern 4: Backoff Calculation (SyncManager)
+
 ```typescript
-test('exponential backoff caps at MAX_BACKOFF_MS', () => {
-  expect(calculateBackoff(0)).toBe(2000);     // 2^1 * 1000
-  expect(calculateBackoff(1)).toBe(4000);     // 2^2 * 1000
-  expect(calculateBackoff(4)).toBe(32000);    // 2^5 * 1000
-  expect(calculateBackoff(5)).toBe(64000);    // 2^6 * 1000, but capped
-  expect(calculateBackoff(10)).toBe(64000);   // MAX_BACKOFF_MS
+test("exponential backoff caps at MAX_BACKOFF_MS", () => {
+  expect(calculateBackoff(0)).toBe(2000); // 2^1 * 1000
+  expect(calculateBackoff(1)).toBe(4000); // 2^2 * 1000
+  expect(calculateBackoff(4)).toBe(32000); // 2^5 * 1000
+  expect(calculateBackoff(5)).toBe(64000); // 2^6 * 1000, but capped
+  expect(calculateBackoff(10)).toBe(64000); // MAX_BACKOFF_MS
 });
 ```
 
 #### Pattern 5: TTL Cleanup (SMSReassemblyManager)
+
 ```typescript
-test('evicts stale incomplete entries after 15 minutes', () => {
+test("evicts stale incomplete entries after 15 minutes", () => {
   jest.useFakeTimers();
   // ... register incomplete TXID ...
-  jest.advanceTimersByTime(15*60*1000 + 1);  // 15 min + 1 sec
-  
-  expect(cache.has(txId)).toBe(false);  // evicted
+  jest.advanceTimersByTime(15 * 60 * 1000 + 1); // 15 min + 1 sec
+
+  expect(cache.has(txId)).toBe(false); // evicted
   jest.useRealTimers();
 });
 ```
@@ -1027,14 +1096,15 @@ test('evicts stale incomplete entries after 15 minutes', () => {
 
 ```typescript
 // Service tests use jest.mock() factories with controlled returns:
-jest.mock('expo-file-system/legacy', () => ({
-  getInfoAsync: jest.fn().mockResolvedValue({exists: true}),
+jest.mock("expo-file-system/legacy", () => ({
+  getInfoAsync: jest.fn().mockResolvedValue({ exists: true }),
   downloadAsync: jest.fn().mockResolvedValue({}),
   makeDirectoryAsync: jest.fn().mockResolvedValue({}),
 }));
 
 // Integration tests (smsIntake) use spyOn + partial mocks:
-const syncSpy = jest.spyOn(SyncController, 'executeAction')
+const syncSpy = jest
+  .spyOn(SyncController, "executeAction")
   .mockResolvedValue(undefined);
 ```
 
@@ -1113,20 +1183,20 @@ const syncSpy = jest.spyOn(SyncController, 'executeAction')
 
 ```typescript
 // Idempotency keys: uppercase hex/alphanumeric, 4-8 chars
-const txId = 'ABC1';  // transaction ID for SMS frame grouping
-const idempotencyKey = 'TX-2026-06-17-0001';  // sync action key
+const txId = "ABC1"; // transaction ID for SMS frame grouping
+const idempotencyKey = "TX-2026-06-17-0001"; // sync action key
 
 // Frame format: KONA:[TXID]:[N]/[T]:[DATA]
-const frameNum = 1;     // 1-indexed
-const totalFrames = 2;  // frame count
-const frameData = 'H=AGAbIFf...';  // Base45 payload segment
+const frameNum = 1; // 1-indexed
+const totalFrames = 2; // frame count
+const frameData = "H=AGAbIFf..."; // Base45 payload segment
 
 // Status enums (SQLite/database)
-const status = 'PENDING' | 'TRANSMITTING' | 'FAILED_BACKOFF';
+const status = "PENDING" | "TRANSMITTING" | "FAILED_BACKOFF";
 
 // Tile coordinates (Web Mercator)
-const tile = {x: 4096, y: 2048, z: 13};
-const bbox = {minLat: -1.28, maxLat: -1.27, minLng: 36.80, maxLng: 36.81};
+const tile = { x: 4096, y: 2048, z: 13 };
+const bbox = { minLat: -1.28, maxLat: -1.27, minLng: 36.8, maxLng: 36.81 };
 
 // Cache/storage paths
 const cachePath = `${cacheDir}/kona_map_tiles/${z}/${x}/${y}.png`;
@@ -1136,38 +1206,55 @@ const cachePath = `${cacheDir}/kona_map_tiles/${z}/${x}/${y}.png`;
 
 ```typescript
 // Controllers
-SyncController  // main ledger router
+SyncController; // main ledger router
 
 // Services
-LocalDatabase, SQLiteSyncRepository, SyncManager, SMSTransportManager,
-SMSReassemblyManager, MapCacheManager
+(LocalDatabase,
+  SQLiteSyncRepository,
+  SyncManager,
+  SMSTransportManager,
+  SMSReassemblyManager,
+  MapCacheManager);
 
 // Interfaces
-KonaSyncAction, CreateTripPayload, StartRidePayload, UpdateFarePayload, EndRidePayload,
-LocalDatabaseRow, SyncQueueRow, ReassemblyRecord
+(KonaSyncAction,
+  CreateTripPayload,
+  StartRidePayload,
+  UpdateFarePayload,
+  EndRidePayload,
+  LocalDatabaseRow,
+  SyncQueueRow,
+  ReassemblyRecord);
 
 // Routes
-smsIntake.ts  // POST /api/v1/sms/gateway-webhook handler
+smsIntake.ts; // POST /api/v1/sms/gateway-webhook handler
 ```
 
 ### 11.3 Method Names
 
 ```typescript
 // Type validation
-typeGuard(), validateAction(), isKonaSyncAction()
+(typeGuard(), validateAction(), isKonaSyncAction());
 
 // Transmission
-processOfflineQueue(), processEntry(), processEntryViaHttps(), processEntryViaSms()
-handleTransmissionFailure(), calculateBackoff()
+(processOfflineQueue(),
+  processEntry(),
+  processEntryViaHttps(),
+  processEntryViaSms());
+(handleTransmissionFailure(), calculateBackoff());
 
 // Reassembly
-processIncomingSegment(), reassembleAndDecode(), cleanExpiredTransmissions()
+(processIncomingSegment(), reassembleAndDecode(), cleanExpiredTransmissions());
 
 // Tile caching
-latLngToTile(), getBoundingBoxTiles(), prefetchRouteTiles(), isTileCached(), downloadTile()
+(latLngToTile(),
+  getBoundingBoxTiles(),
+  prefetchRouteTiles(),
+  isTileCached(),
+  downloadTile());
 
 // Database
-enqueue(), dequeue(), getQueue(), updateStatus(), getById()
+(enqueue(), dequeue(), getQueue(), updateStatus(), getById());
 ```
 
 ---
@@ -1183,7 +1270,7 @@ if (isProcessed) return;
 
 // ... execute ...
 
-await redis.setex(`processed:${idempotencyKey}`, 24*60*60, '1');  // 24h TTL
+await redis.setex(`processed:${idempotencyKey}`, 24 * 60 * 60, "1"); // 24h TTL
 ```
 
 ### 12.2 Cloud Sync Endpoint
@@ -1205,13 +1292,18 @@ private static async handleCreateTrip(payload: Record<string, unknown>) {
 ```typescript
 // Track transmission success/failure rates:
 class Metrics {
-  syncAttempts = new Counter('sync_attempts_total', ['action_type', 'transport']);
-  syncDuration = new Histogram('sync_duration_seconds', ['action_type']);
-  tileDownloads = new Counter('tile_downloads_total', ['zoom', 'result']);
+  syncAttempts = new Counter("sync_attempts_total", [
+    "action_type",
+    "transport",
+  ]);
+  syncDuration = new Histogram("sync_duration_seconds", ["action_type"]);
+  tileDownloads = new Counter("tile_downloads_total", ["zoom", "result"]);
 }
 
 // Usage:
-metrics.syncAttempts.labels({action_type: 'CREATE_TRIP', transport: 'HTTPS'}).inc();
+metrics.syncAttempts
+  .labels({ action_type: "CREATE_TRIP", transport: "HTTPS" })
+  .inc();
 ```
 
 ### 12.4 Multi-Tenant Support
@@ -1219,7 +1311,7 @@ metrics.syncAttempts.labels({action_type: 'CREATE_TRIP', transport: 'HTTPS'}).in
 ```typescript
 // Add tenant_id to all queue rows:
 interface SyncQueueRow {
-  tenant_id: string;  // customer/organization identifier
+  tenant_id: string; // customer/organization identifier
   idempotency_key: string;
   // ...
 }
@@ -1227,7 +1319,7 @@ interface SyncQueueRow {
 // Scope database queries:
 const queue = await db.query(
   `SELECT * FROM pending_sync_queue WHERE tenant_id = ? AND status = ?`,
-  [tenantId, 'PENDING']
+  [tenantId, "PENDING"],
 );
 ```
 
@@ -1238,21 +1330,25 @@ const queue = await db.query(
 ### 13.1 Common Issues
 
 #### Issue: SMS frames arriving out of order
+
 **Symptom:** Frame 2/2 arrives before frame 1/2
 **Root Cause:** Telecom gateway doesn't guarantee delivery order
 **Solution:** SMSReassemblyManager caches by frame number, reassembles in order regardless of arrival sequence
 
 #### Issue: Duplicate actions executing
+
 **Symptom:** Same trip created twice with idempotency_key X
 **Root Cause:** Retry storm after partial success (action executed, response lost)
 **Solution:** Check `processedIdempotencyKeys.has(X)` before routing; update after handler completes
 
 #### Issue: Tiles not pre-fetching
+
 **Symptom:** `prefetchRouteTiles()` returns {downloaded: 0, skipped: 100, failed: 0}
 **Root Cause:** All tiles already cached (isTileCached returns true)
 **Solution:** Check cache directory exists (`{cacheDir}/kona_map_tiles/`); clear old tiles if stale
 
 #### Issue: SMS transport hanging
+
 **Symptom:** Transmission attempt never returns
 **Root Cause:** Telecom gateway not responding
 **Solution:** Add explicit timeout (30s), then fallthrough to retry with backoff
@@ -1302,7 +1398,7 @@ npm test -- --verbose
 5. ✅ **Maintains consistency** across dual-layer persistence (LocalDatabase + SQLiteRepository)
 6. ✅ **Fails gracefully** with exponential backoff, TTL cleanup, and error isolation
 
-**Test Coverage:** 162 comprehensive tests across 6 suites; all passing ✓
+**Test Coverage:** 261 tests across 16 suites; all passing ✓
 
 **Code Quality:** TypeScript strict mode; zero compile errors ✓
 
@@ -1312,19 +1408,19 @@ npm test -- --verbose
 
 ## Appendix A: File Size Summary
 
-| File | Lines | Purpose |
-|------|-------|---------|
-| SyncController.ts | 240 | Transaction routing matrix |
-| smsIntake.ts | 145 | Express webhook endpoint |
-| smsIntake.test.ts | 500+ | Integration tests (19 tests) |
-| LocalDatabase.ts | 140 | Payload persistence |
-| SyncManager.ts | 270 | Offline queue processor |
-| SQLiteSyncRepository.ts | 165 | Transmission state tracking |
-| SMSTransportManager.ts | 130 | Frame splitting |
-| SMSReassemblyManager.ts | 125 | Frame reassembly + decode |
-| MapCacheManager.ts | 425 | Web Mercator tile caching |
-| Test Suites (5) | 1680 | 162 tests total |
-| **TOTAL** | **3920+** | Complete offline sync system |
+| File                    | Lines     | Purpose                      |
+| ----------------------- | --------- | ---------------------------- |
+| SyncController.ts       | 240       | Transaction routing matrix   |
+| smsIntake.ts            | 145       | Express webhook endpoint     |
+| smsIntake.test.ts       | 500+      | Integration tests (19 tests) |
+| LocalDatabase.ts        | 140       | Payload persistence          |
+| SyncManager.ts          | 270       | Offline queue processor      |
+| SQLiteSyncRepository.ts | 165       | Transmission state tracking  |
+| SMSTransportManager.ts  | 130       | Frame splitting              |
+| SMSReassemblyManager.ts | 125       | Frame reassembly + decode    |
+| MapCacheManager.ts      | 425       | Web Mercator tile caching    |
+| Test Suites (16)        | Current   | 261 tests total              |
+| **TOTAL**               | inventory | Complete offline sync system |
 
 ---
 
