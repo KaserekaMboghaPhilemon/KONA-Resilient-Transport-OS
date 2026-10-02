@@ -5,8 +5,9 @@
   "description": "KONA Sprint 2 Edge-State SQLite Local Node Cache",
   "main": "src/db/LocalDatabase.ts",
   "scripts": {
-    "dev": "tsx watch src/index.ts",
-    "test": "jest --verbose --forceExit"
+    "dev": "ts-node-dev --respawn --transpile-only --project tsconfig.dev.json src/index.ts",
+    "build": "tsc",
+    "test": "jest"
   },
   "dependencies": {
     "@noble/hashes": "^2.2.0",
@@ -36,7 +37,7 @@
     "react-native": "^0.86.0",
     "supertest": "^7.2.2",
     "ts-jest": "^29.2.0",
-    "tsx": "^4.23.15",
+    "ts-node-dev": "^2.0.0",
     "typescript": "^5.4.0"
   },
   "jest": {
