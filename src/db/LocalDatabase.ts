@@ -233,7 +233,7 @@ export async function queueOfflineTransaction(
   // Build the cryptographic ledger chain: bind this row's payload to the
   // signature of the row immediately preceding it so any retroactive
   // modification of an older record breaks the chain at audit time.
-  const previousHash = await LocalLedgerGuard.getLastRowSignature(db, 'offline_sync_queue');
+  const previousHash = await LocalLedgerGuard.getLastRowSignature(db);
   const rowSignature = await LocalLedgerGuard.computeChainHash(payloadCompressed, previousHash, deviceSecret);
 
   const result = await db.runAsync(

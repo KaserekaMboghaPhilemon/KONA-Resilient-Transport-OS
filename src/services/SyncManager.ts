@@ -450,7 +450,7 @@ export class SyncManager {
     }
 
     if (liveState === 'internet') {
-      // Mark the entry as TRANSMITTING in SQLiteSyncRepository before dispatching.
+      // Record the attempt time on the canonical outbox row before dispatching.
       const repoRow = this.repoMap.get(entry.idempotency_key);
       if (repoRow) {
         await SQLiteSyncRepository.updateStatus(repoRow.id, 'TRANSMITTING');
@@ -503,8 +503,7 @@ export class SyncManager {
 
       await markQueueEntryAsSynced(entry.idempotency_key);
 
-      // Permanently remove from SQLiteSyncRepository now that the server has
-      // acknowledged receipt.
+      // Keep the append-only outbox row after its acknowledgement.
       const repoRow = this.repoMap.get(entry.idempotency_key);
       if (repoRow) {
         await SQLiteSyncRepository.dequeue(repoRow.id);
@@ -561,8 +560,7 @@ export class SyncManager {
 
       await markQueueEntryAsSynced(entry.idempotency_key);
 
-      // Permanently remove from SQLiteSyncRepository now that the SMS gateway
-      // has accepted the message.
+      // Keep the append-only outbox row after the gateway accepts the message.
       const repoRow = this.repoMap.get(entry.idempotency_key);
       if (repoRow) {
         await SQLiteSyncRepository.dequeue(repoRow.id);
@@ -613,8 +611,7 @@ export class SyncManager {
     if (newAttemptCount >= MAX_RETRY_ATTEMPTS) {
       await markQueueEntryAsFailed(entry.idempotency_key);
 
-      // Dequeue permanently from SQLiteSyncRepository — entry is quarantined
-      // in LocalDatabase with sync_status = 'failed'.
+      // Retain the failed entry in the canonical outbox for auditability.
       const repoRow = this.repoMap.get(entry.idempotency_key);
       if (repoRow) {
         await SQLiteSyncRepository.dequeue(repoRow.id);
@@ -631,10 +628,10 @@ export class SyncManager {
       };
     }
 
-    // Back off and mark as FAILED_BACKOFF in SQLiteSyncRepository.
+    // Record retry timing in the canonical outbox; retry count was incremented above.
     const repoRow = this.repoMap.get(entry.idempotency_key);
     if (repoRow) {
-      await SQLiteSyncRepository.updateStatus(repoRow.id, 'FAILED_BACKOFF', 1);
+      await SQLiteSyncRepository.updateStatus(repoRow.id, 'FAILED_BACKOFF');
     }
 
     const backoffMs = Math.min(

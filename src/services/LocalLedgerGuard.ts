@@ -1,6 +1,8 @@
 import { CryptoSignatureEngine } from './CryptoSignatureEngine';
 import * as SQLite from 'expo-sqlite';
 
+export const CANONICAL_OUTBOX_TABLE = 'offline_sync_queue';
+
 export interface AuditChainEntry {
   id: number;
   payload: string;
@@ -13,7 +15,10 @@ export class LocalLedgerGuard {
    * Fetches the signature of the absolute last entry inserted into the queue table.
    * This forms the link anchor ($H_{n-1}$) for our new block.
    */
-  public static async getLastRowSignature(db: SQLite.SQLiteDatabase, tableName: string): Promise<string> {
+  public static async getLastRowSignature(
+    db: SQLite.SQLiteDatabase,
+    tableName = CANONICAL_OUTBOX_TABLE,
+  ): Promise<string> {
     const row = await db.getFirstAsync<{ row_signature: string }>(
       `SELECT row_signature FROM ${tableName} ORDER BY id DESC LIMIT 1;`
     );
@@ -38,14 +43,28 @@ export class LocalLedgerGuard {
    * Audits an entire local storage table end-to-end to verify chain continuity.
    * @returns true if the database log is uncompromised, false if a structural break is caught.
    */
-  public static async verifyTableIntegrity(
+  public static verifyTableIntegrity(
+    db: SQLite.SQLiteDatabase,
+    deviceSecret: string,
+  ): Promise<boolean>;
+  public static verifyTableIntegrity(
     db: SQLite.SQLiteDatabase,
     tableName: string,
-    deviceSecret: string
+    deviceSecret: string,
+  ): Promise<boolean>;
+  public static async verifyTableIntegrity(
+    db: SQLite.SQLiteDatabase,
+    tableNameOrSecret: string,
+    deviceSecret?: string,
   ): Promise<boolean> {
+    const tableName = deviceSecret === undefined
+      ? CANONICAL_OUTBOX_TABLE
+      : tableNameOrSecret;
+    const normalizedSecret = deviceSecret ?? tableNameOrSecret;
+
     try {
       const rows = await db.getAllAsync<AuditChainEntry>(
-        `SELECT id, COALESCE(payload, payload_compressed) AS payload, previous_row_hash, row_signature
+        `SELECT id, payload_compressed AS payload, previous_row_hash, row_signature
          FROM ${tableName}
          ORDER BY id ASC;`
       );
@@ -66,7 +85,11 @@ export class LocalLedgerGuard {
         }
 
         // 2. Re-calculate current row's block signature
-        const computedSig = await this.computeChainHash(row.payload, expectedPreviousHash, deviceSecret);
+        const computedSig = await this.computeChainHash(
+          row.payload,
+          expectedPreviousHash,
+          normalizedSecret,
+        );
         if (row.row_signature !== computedSig) {
           console.error(`[LedgerAudit] Tampering detected at row ID ${row.id}: Signature validation failed.`);
           return false;

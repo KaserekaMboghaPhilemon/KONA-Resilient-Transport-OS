@@ -9,6 +9,6 @@
 - **Absolute Order Lockout:** An active driver is structurally blocked from receiving, bidding on, or viewing subsequent marketplace offers until their active order lifecycle drops into a complete 'Settled' state.
 - **State-Driven Exemption Windows:** The System Order Tracker continuously tracks real-time progress via two metric counters:
   * `Time_To_Complete` (Estimated minutes remaining based on regional velocity profiles)
-  * `Km_Remained` (Calculated distance remaining to destination H3 polygon coordinates)
+  * `Km_Remaihned` (Calculated distance remaining to destination H3 polygon coordinates)
   If the active metrics drop below strict thresholds, the backend opens a predictive window allowing the driver to bid on incoming connecting fares.
 - **Ubiquitous Fallback Dispatching:** If no predictive matches are made, the allocation engine filters and routes the trip to all physically nearby available drivers within the order's local H3 hexagon perimeter, regardless of external bidding queues.

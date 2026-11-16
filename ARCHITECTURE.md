@@ -93,51 +93,35 @@ ARCHITECTURE.md                        (This file)
 
 ## 4. Architectural Patterns
 
-### 4.1 Dual-Layer Persistence
+### 4.1 Canonical SQLite Outbox
 
-**Problem:** Track both:
+The client uses one SQLite database file, `kona_local_cache.db`, and one
+append-only outbox table, `offline_sync_queue`. It stores the idempotency key,
+order/action identity, compressed payload, chain signature, retry bookkeeping,
+and final sync status.
 
-- **Payload decompression state** (LocalDatabase: sync_status field)
-- **Transmission delivery state** (SQLiteSyncRepository: PENDING → TRANSMITTING → COMPLETED/FAILED_BACKOFF)
-
-**Solution:** Two parallel SQLite tables:
-
-```
-LocalDatabase:
-  └── sync_queue
-      ├── id (PK)
-      ├── order_id
-      ├── action_type
-      ├── payload (JSON)
-      └── sync_status: 'PENDING' | 'SYNCED' | 'ERROR'
-
-SQLiteSyncRepository:
-  └── pending_sync_queue
-      ├── id (PK)
-      ├── idempotency_key (UNIQUE)
-      ├── action_type
-      ├── payload (JSON)
-      ├── status: 'PENDING' | 'TRANSMITTING' | 'FAILED_BACKOFF'
-      ├── attempt_count (retries)
-      └── last_attempt_at (timestamp)
-```
+`SQLiteSyncRepository` is retained as a deprecated compatibility facade. It
+delegates initialization, insertion, reads, and integrity verification to the
+same `LocalDatabase` table; it no longer creates a second database or table.
+`LocalLedgerGuard` and `StateCoordinator` verify `offline_sync_queue`.
 
 **Data Flow:**
 
 ```
-LocalDatabase.enqueue()
+LocalDatabase.queueOfflineTransaction()
     ↓
-SyncManager.processOfflineQueue() fetches both tables
-    ↓ (builds repoMap: Map<key, SQLiteRow>)
+SyncManager.processOfflineQueue() reads pending rows from offline_sync_queue
     ↓
-SyncManager.processEntry() marks TRANSMITTING in SQLiteSyncRepository
+SQLiteSyncRepository compatibility methods operate on those same row IDs
     ↓
 Transmission (HTTPS or SMS)
-    ↓ [success]
-SQLiteSyncRepository.dequeue() removes row
-    ↓ [failure]
-SQLiteSyncRepository.updateStatus(..., 'FAILED_BACKOFF', attemptIncrement)
+    ├─ success → mark sync_status = 'synced' (retain the signed row)
+    ├─ retry   → increment attempt_count and update last_attempt_at
+    └─ ceiling → mark sync_status = 'failed'
 ```
+
+Server repository tables are defined in `SPRINT1_SCHEMA.sql` and the matching
+Knex migration at `migrations/20261116100000_create_runtime_repository_tables.js`.
 
 ### 4.2 Adaptive Dual-Path Transmission
 
@@ -425,54 +409,27 @@ Frame 2/2 from +254700000002 (different sender)
 
 ### 5.4 SyncManager.ts — Offline Queue Processor
 
-**Purpose:** Poll LocalDatabase + SQLiteSyncRepository queue, dispatch via HTTPS/SMS with retry backoff.
+**Purpose:** Read pending rows from the canonical LocalDatabase outbox and
+dispatch via HTTPS/SMS with retry backoff.
 
 **Core Attributes:**
-
-```typescript
-private readonly db: LocalDatabase;
-private readonly smsTransport: SMSTransportManager;
-private readonly httpTransport: HttpTransport;
-private readonly retryConfig = {
-  BASE_BACKOFF_MS: 2000,
-  MAX_BACKOFF_MS: 64000,
-  MAX_RETRY_ATTEMPTS: 5,
-};
-private readonly repoMap = new Map<string, SyncQueueRow>();  // idempotency_key → row
-```
 
 **Main Loop: processOfflineQueue()**
 
 ```
-┌─ fetch LocalDatabase.getQueue() → Array<LocalDatabaseRow>
-├─ fetch SQLiteSyncRepository.getActiveQueue() → Array<SyncQueueRow>
-├─ build repoMap: Map<idempotency_key, SyncQueueRow>
-│
-├─ for each LocalDatabaseRow
-│  ├─ const row = repoMap.get(idempotency_key)
-│  ├─ if (!row) {
-│  │   SQLiteSyncRepository.enqueue(...)  // new transmission
-│  │ }
-│  ├─ await this.processEntry(row)
-│  └─ continue
-│
-└─ schedule next poll (e.g., 10 seconds)
+fetch LocalDatabase.getPendingQueueEntries()
+    ↓
+for each pending outbox row, transmit in FIFO order
+    ↓
+persist retry count/status on that same row
 ```
 
-**Per-Entry Dispatch: processEntry(row: SyncQueueRow)**
+**Per-Entry Dispatch:**
 
 ```
-├─ mark row.status = 'TRANSMITTING' in SQLiteSyncRepository
-│
-├─ try {
-│   await this.processEntryViaHttps(row)
-│   SQLiteSyncRepository.dequeue(row.id)  // success
-│ } catch (httpsError) {
-│   await this.processEntryViaSms(row)
-│   SQLiteSyncRepository.dequeue(row.id)  // success
-│ } catch (smsError) {
-│   this.handleTransmissionFailure(row, error)
-│ }
+internet → HTTPS; sms_only → SMS; none → leave the row pending
+success → markQueueEntryAsSynced()
+failure → incrementQueueEntryAttemptCount(), then retry or mark failed
 ```
 
 **Retry Strategy: handleTransmissionFailure()**
@@ -484,15 +441,10 @@ const nextBackoff = Math.min(
 );
 
 if (attempt >= MAX_RETRY_ATTEMPTS) {
-  SQLiteSyncRepository.updateStatus(row.id, 'PERMANENT_FAILURE')
-  throw new Error('Max retries exceeded');
+  LocalDatabase.markQueueEntryAsFailed(idempotencyKey)
 } else {
-  SQLiteSyncRepository.updateStatus(
-    row.id,
-    'FAILED_BACKOFF',
-    attemptIncrement=1
-  );
-  scheduleRetry(nextBackoff);
+  LocalDatabase.incrementQueueEntryAttemptCount(idempotencyKey)
+  wait(nextBackoff)
 }
 ```
 
@@ -507,60 +459,13 @@ if (attempt >= MAX_RETRY_ATTEMPTS) {
 
 ---
 
-### 5.5 SQLiteSyncRepository.ts — Persistent Transmission State
+### 5.5 SQLiteSyncRepository.ts — Deprecated Compatibility Facade
 
-**Purpose:** Track sync queue status (PENDING → TRANSMITTING → COMPLETED/FAILED_BACKOFF).
-
-**Table Schema:**
-
-```sql
-CREATE TABLE IF NOT EXISTS pending_sync_queue (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  idempotency_key TEXT UNIQUE NOT NULL,
-  action_type TEXT NOT NULL,
-  payload TEXT NOT NULL,  -- JSON
-  status TEXT NOT NULL DEFAULT 'PENDING',  -- PENDING | TRANSMITTING | FAILED_BACKOFF
-  attempt_count INTEGER DEFAULT 0,
-  last_attempt_at TIMESTAMP,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-```
-
-**Core Methods:**
-
-1. **initialize(): Promise<void>**
-   - Create table if not exists
-   - No initialization data required
-
-2. **enqueue(idempotencyKey, actionType, payload): Promise<number>**
-
-   ```
-   INSERT INTO pending_sync_queue (...) VALUES (...)
-   RETURNING id
-   ```
-
-   - Throws on duplicate idempotency_key (UNIQUE constraint)
-
-3. **getActiveQueue(): Promise<SyncQueueRow[]>**
-
-   ```
-   SELECT * FROM pending_sync_queue
-   WHERE status IN ('PENDING', 'FAILED_BACKOFF')
-   ORDER BY created_at ASC
-   ```
-
-4. **updateStatus(id, status, attemptIncrement): Promise<void>**
-
-   ```
-   UPDATE pending_sync_queue
-   SET status = ?, attempt_count = attempt_count + ?, last_attempt_at = NOW()
-   WHERE id = ?
-   ```
-
-5. **dequeue(id): Promise<void>**
-   ```
-   DELETE FROM pending_sync_queue WHERE id = ?
-   ```
+`SQLiteSyncRepository` no longer owns persistent schema. Its `initialize()`,
+`enqueue()`, `getActiveQueue()`, `updateStatus()`, `dequeue()`, and
+`verifyQueueIntegrity()` methods delegate to `LocalDatabase` and the canonical
+`offline_sync_queue`. Synced and failed rows remain in the append-only outbox;
+`dequeue()` marks a still-pending row as synced rather than deleting it.
 
 ---
 
@@ -597,7 +502,7 @@ return true;
 
 **Purpose:** Pre-fetch offline map tiles along planned route.
 
-**Core Methods:**
+**Core Methods:** 
 
 1. **latLngToTile(lat: number, lng: number, zoom: number): {x, y, z}**
 
@@ -692,25 +597,31 @@ return true;
 
 **Purpose:** Persistent local queue for actions pending sync.
 
-**Table Schema:**
+**Table Schema (`kona_local_cache.db`):**
 
 ```sql
-CREATE TABLE IF NOT EXISTS sync_queue (
+CREATE TABLE IF NOT EXISTS offline_sync_queue (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  idempotency_key TEXT NOT NULL UNIQUE,
   order_id TEXT NOT NULL,
   action_type TEXT NOT NULL,
-  payload TEXT NOT NULL,  -- JSON
-  sync_status TEXT DEFAULT 'PENDING',  -- PENDING | SYNCED | ERROR
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  payload_compressed TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  last_attempt_at INTEGER,
+  synced_at INTEGER,
+  sync_status TEXT NOT NULL DEFAULT 'pending',
+  previous_row_hash TEXT NOT NULL,
+  row_signature TEXT NOT NULL
 );
 ```
 
 **Core Methods:**
 
-1. **enqueue(orderId, actionType, payload): Promise<number>**
-2. **getQueue(): Promise<LocalDatabaseRow[]>**
-3. **updateStatus(id, syncStatus): Promise<void>**
-4. **getById(id): Promise<LocalDatabaseRow | null>**
+1. **initDatabase(): Promise<SQLiteDatabase>**
+2. **queueOfflineTransaction(orderId, actionType, payload, deviceSecret): Promise<QueueResult>**
+3. **getPendingQueueEntries(limit): Promise<QueueEntry[]>**
+4. **markQueueEntryAsSynced(idempotencyKey), incrementQueueEntryAttemptCount(idempotencyKey), markQueueEntryAsFailed(idempotencyKey)**
 
 ---
 
@@ -772,11 +683,11 @@ SyncManager.processOfflineQueue()
        └─ on failure:
           ├─ attempt < MAX_RETRY_ATTEMPTS
           │  ├─ calculate backoff: BASE << attempt
-          │  ├─ update status FAILED_BACKOFF, increment attempt
+          │  ├─ retain pending status; update attempt_count and last_attempt_at
           │  └─ schedule next poll (backoff seconds)
           │
           └─ attempt >= MAX_RETRY_ATTEMPTS
-             └─ dequeue (permanent failure)
+             └─ mark sync_status = 'failed' and retain the row
 ```
 
 ### 6.3 Map Tile Pre-fetch Workflow
@@ -850,24 +761,31 @@ interface EndRidePayload {
 ### 7.2 Database Row Types
 
 ```typescript
-interface LocalDatabaseRow {
+interface QueueEntry {
   id: number;
+  idempotency_key: string;
   order_id: string;
-  action_type: string;
-  payload: Record<string, unknown>;
-  sync_status: "PENDING" | "SYNCED" | "ERROR";
-  created_at: string;
+  action_type: OfflineActionType;
+  payload_compressed: string;
+  created_at: number;
+  attempt_count: number;
+  last_attempt_at: number | null;
+  synced_at: number | null;
+  sync_status: "pending" | "synced" | "failed";
+  previous_row_hash: string;
+  row_signature: string;
 }
 
 interface SyncQueueRow {
   id: number;
   idempotency_key: string;
   action_type: string;
-  payload: Record<string, unknown>;
-  status: "PENDING" | "TRANSMITTING" | "FAILED_BACKOFF";
+  payload: string;
+  status: "PENDING";
   attempt_count: number;
   last_attempt_at: string | null;
-  created_at: string;
+  previous_row_hash: string;
+  row_signature: string;
 }
 
 interface ReassemblyRecord {
@@ -1318,8 +1236,8 @@ interface SyncQueueRow {
 
 // Scope database queries:
 const queue = await db.query(
-  `SELECT * FROM pending_sync_queue WHERE tenant_id = ? AND status = ?`,
-  [tenantId, "PENDING"],
+  `SELECT * FROM offline_sync_queue WHERE tenant_id = ? AND sync_status = ?`,
+  [tenantId, "pending"],
 );
 ```
 

@@ -137,6 +137,11 @@ describe('StateCoordinator', () => {
     await StateCoordinator.syncAllSystems('trip-healthy-001');
 
     expect(LocalLedgerGuard.verifyTableIntegrity).toHaveBeenCalledTimes(1);
+    expect(LocalLedgerGuard.verifyTableIntegrity).toHaveBeenCalledWith(
+      db,
+      'offline_sync_queue',
+      DEVICE_SECRET,
+    );
   expect(runQueueSync).toHaveBeenCalledTimes(1);
   expect(runTelemetrySync).toHaveBeenCalledTimes(1);
   expect(order).toEqual(['verify', 'queue', 'telemetry']);

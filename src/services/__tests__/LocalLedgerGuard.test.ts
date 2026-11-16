@@ -111,6 +111,21 @@ describe('LocalLedgerGuard - Cryptographic Ledger Chain', () => {
   const DEVICE_SECRET = 'device_test_secret_key_12345';
   const TEST_TABLE = 'test_audit_chain';
 
+  it('uses the canonical outbox table when no table name is supplied', async () => {
+    const { db } = createMockDatabase();
+
+    await expect(
+      LocalLedgerGuard.verifyTableIntegrity(db, DEVICE_SECRET),
+    ).resolves.toBe(true);
+
+    expect(db.getAllAsync).toHaveBeenCalledWith(
+      expect.stringContaining('SELECT id, payload_compressed AS payload'),
+    );
+    expect(db.getAllAsync).toHaveBeenCalledWith(
+      expect.stringContaining('FROM offline_sync_queue'),
+    );
+  });
+
   // ===========================================================================
   // Test Suite 1: Sequential Chain Generation
   // ===========================================================================

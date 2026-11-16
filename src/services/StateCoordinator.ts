@@ -1,5 +1,5 @@
 import type * as SQLite from 'expo-sqlite';
-import { LocalLedgerGuard } from './LocalLedgerGuard';
+import { CANONICAL_OUTBOX_TABLE, LocalLedgerGuard } from './LocalLedgerGuard';
 
 export type CoordinatorEngineStatus =
   | 'IDLE'
@@ -44,7 +44,7 @@ interface StateCoordinatorDependencies {
   haltOutboundTransports: () => void | Promise<void>;
 }
 
-const DEFAULT_VERIFY_TABLE = 'pending_sync_queue';
+const DEFAULT_VERIFY_TABLE = CANONICAL_OUTBOX_TABLE;
 
 type SyncManagerLike = {
   processOfflineQueue: () => Promise<unknown>;
@@ -54,8 +54,8 @@ type SyncManagerLike = {
 function createDefaultDependencies(): StateCoordinatorDependencies {
   return {
     getLedgerDatabase: async () => {
-      const { SQLiteSyncRepository } = await import('./SQLiteSyncRepository');
-      return SQLiteSyncRepository.initialize();
+      const { initDatabase } = await import('../db/LocalDatabase');
+      return initDatabase();
     },
     getDeviceSecret: async () => StateCoordinator.resolveDeviceSecret(),
     verifyTableName: DEFAULT_VERIFY_TABLE,
