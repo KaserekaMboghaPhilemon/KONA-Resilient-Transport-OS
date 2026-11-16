@@ -46,7 +46,25 @@ describe('ServerLedgerReconciler', () => {
       DEVICE_SECRET,
     );
 
-    expect(result).toEqual({ success: true });
+    expect(result).toEqual({ success: true, orderedRows: rows });
+  });
+
+  it('returns rows in verified sequence order regardless of input order', async () => {
+    const orderedRows = buildChainRows([
+      JSON.stringify({ action_type: 'CREATE_TRIP', order_id: 'ord-order' }),
+      JSON.stringify({ action_type: 'START_RIDE', order_id: 'ord-order' }),
+    ]);
+
+    const result = await ServerLedgerReconciler.verifyIncomingChain(
+      [...orderedRows].reverse(),
+      null,
+      DEVICE_SECRET,
+    );
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.orderedRows.map((row) => row.id)).toEqual([1, 2]);
+    }
   });
 
   it('rejects rows when an ID gap is detected', async () => {
@@ -63,8 +81,10 @@ describe('ServerLedgerReconciler', () => {
     );
 
     expect(result.success).toBe(false);
-    expect(result.error).toBe('GAP_DETECTED');
-    expect(result.failedRowId).toBe(3);
+    if (result.success === false) {
+      expect(result.error).toBe('GAP_DETECTED');
+      expect(result.failedRowId).toBe(3);
+    }
   });
 
   it('rejects tampered payload signatures', async () => {
@@ -80,8 +100,10 @@ describe('ServerLedgerReconciler', () => {
     );
 
     expect(result.success).toBe(false);
-    expect(result.error).toBe('INVALID_SIGNATURE');
-    expect(result.failedRowId).toBe(1);
+    if (result.success === false) {
+      expect(result.error).toBe('INVALID_SIGNATURE');
+      expect(result.failedRowId).toBe(1);
+    }
   });
 
   it('rejects chain pointer mismatch as genesis mismatch breach', async () => {
@@ -97,8 +119,10 @@ describe('ServerLedgerReconciler', () => {
     );
 
     expect(result.success).toBe(false);
-    expect(result.error).toBe('GENESIS_MISMATCH');
-    expect(result.failedRowId).toBe(1);
+    if (result.success === false) {
+      expect(result.error).toBe('GENESIS_MISMATCH');
+      expect(result.failedRowId).toBe(1);
+    }
   });
 
   it('verifies admin signature and emits deterministic sweep token', () => {

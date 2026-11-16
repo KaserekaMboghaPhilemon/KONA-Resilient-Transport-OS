@@ -14,11 +14,13 @@ export type ReconciliationErrorCode =
   | 'INVALID_SIGNATURE'
   | 'GENESIS_MISMATCH';
 
-export interface ReconciliationResult {
-  success: boolean;
-  error?: ReconciliationErrorCode;
-  failedRowId?: number;
-}
+export type ReconciliationResult =
+  | { success: true; orderedRows: IncomingLedgerRow[] }
+  | {
+      success: false;
+      error: ReconciliationErrorCode;
+      failedRowId: number;
+    };
 
 export class ServerLedgerReconciler {
   /**
@@ -30,7 +32,7 @@ export class ServerLedgerReconciler {
     deviceSecret: string,
   ): Promise<ReconciliationResult> {
     if (rows.length === 0) {
-      return { success: true };
+      return { success: true, orderedRows: [] };
     }
 
     let expectedPreviousHash = lastValidServerHash || GENESIS_ANCHOR;
@@ -63,7 +65,7 @@ export class ServerLedgerReconciler {
       expectedRowId++;
     }
 
-    return { success: true };
+    return { success: true, orderedRows: sortedRows };
   }
 
   public static verifyBatchSignature(

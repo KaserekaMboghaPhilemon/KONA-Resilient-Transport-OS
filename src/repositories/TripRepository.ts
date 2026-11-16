@@ -1,10 +1,12 @@
 import { knex } from '../database/knex';
+import type { Knex } from 'knex';
 
 export class TripRepository {
   public static async createTripRecord(
     payload: Record<string, unknown>,
+    trx: Knex | Knex.Transaction = knex,
   ): Promise<void> {
-    await knex('trips').insert({
+    await trx('trips').insert({
       order_id: payload.order_id,
       driver_id: payload.driver_id,
       origin:
@@ -23,8 +25,9 @@ export class TripRepository {
   public static async updateTripStatus(
     tripId: string,
     status: string,
+    trx: Knex | Knex.Transaction = knex,
   ): Promise<void> {
-    await knex('trips').where({ order_id: tripId }).update({
+    await trx('trips').where({ order_id: tripId }).update({
       status,
       updated_at: new Date(),
     });
@@ -33,8 +36,9 @@ export class TripRepository {
   public static async updateTripFare(
     tripId: string,
     amount: number,
+    trx: Knex | Knex.Transaction = knex,
   ): Promise<void> {
-    await knex('trips').where({ order_id: tripId }).update({
+    await trx('trips').where({ order_id: tripId }).update({
       fare_amount: amount,
       updated_at: new Date(),
     });
@@ -43,20 +47,19 @@ export class TripRepository {
   public static async terminateTripLifecycle(
     tripId: string,
     payload: Record<string, unknown>,
+    trx: Knex | Knex.Transaction = knex,
   ): Promise<void> {
-    await knex.transaction(async (trx) => {
-      await trx('trips').where({ order_id: tripId }).update({
-        status: 'COMPLETED',
-        updated_at: new Date(),
-      });
+    await trx('trips').where({ order_id: tripId }).update({
+      status: 'COMPLETED',
+      updated_at: new Date(),
+    });
 
-      await trx('driver_ledgers').insert({
-        order_id: tripId,
-        driver_id: payload.driver_id,
-        amount: payload.final_fare,
-        transaction_type: 'TRIP_SETTLEMENT',
-        created_at: new Date(),
-      });
+    await trx('driver_ledgers').insert({
+      order_id: tripId,
+      driver_id: payload.driver_id,
+      amount: payload.final_fare,
+      transaction_type: 'TRIP_SETTLEMENT',
+      created_at: new Date(),
     });
   }
 

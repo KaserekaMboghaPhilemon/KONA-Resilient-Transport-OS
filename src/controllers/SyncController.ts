@@ -1,7 +1,9 @@
+import { knex } from '../database/knex';
 import { IdempotencyRepository } from '../repositories/IdempotencyRepository';
 import { TripRepository } from '../repositories/TripRepository';
 import { DriverSecretRepository } from '../repositories/DriverSecretRepository';
 import { CryptoSignatureEngine } from '../services/CryptoSignatureEngine';
+import type { Knex } from 'knex';
 import {
   IncomingLedgerRow,
   ReconciliationErrorCode,
@@ -37,6 +39,12 @@ interface KonaSecurityEnvelope {
   __kona_signature_hex?: unknown;
   __kona_raw_wire?: unknown;
 }
+
+interface PreparedSyncAction {
+  action: KonaSyncAction;
+}
+
+type PostCommitAction = () => Promise<void>;
 
 export class SignatureAuthenticationError extends Error {
   constructor(message: string) {
@@ -124,7 +132,8 @@ export class SyncController {
       );
     }
 
-    for (const row of input.rows) {
+    const preparedActions: PreparedSyncAction[] = [];
+    for (const row of reconciliation.orderedRows) {
       let decoded: unknown;
       try {
         decoded = JSON.parse(row.payload);
@@ -133,8 +142,21 @@ export class SyncController {
           `[SyncController] Invalid JSON payload in incoming row ${row.id}.`,
         );
       }
-      await this.executeAction(decoded);
+      preparedActions.push(await this.prepareAction(decoded));
     }
+
+    const postCommitActions = await knex.transaction(async (trx) => {
+      const actions: PostCommitAction[] = [];
+      for (const preparedAction of preparedActions) {
+        const postCommitAction = await this.executePreparedAction(preparedAction, trx);
+        if (postCommitAction) {
+          actions.push(postCommitAction);
+        }
+      }
+      return actions;
+    });
+
+    await this.runPostCommitActions(postCommitActions);
 
     return {
       success: true,
@@ -151,6 +173,16 @@ export class SyncController {
    * @throws {TypeError} When required fields are missing or malformed.
    */
   public static async executeAction(action: unknown): Promise<void> {
+    const preparedAction = await this.prepareAction(action);
+    const postCommitActions = await knex.transaction(async (trx) => {
+      const postCommitAction = await this.executePreparedAction(preparedAction, trx);
+      return postCommitAction ? [postCommitAction] : [];
+    });
+
+    await this.runPostCommitActions(postCommitActions);
+  }
+
+  private static async prepareAction(action: unknown): Promise<PreparedSyncAction> {
     if (!action || typeof action !== 'object') {
       throw new TypeError(
         '[SyncController] Invalid action format: Action must be an object.',
@@ -186,20 +218,24 @@ export class SyncController {
       throw new TypeError('[SyncController] Missing or malformed required field: "payload".');
     }
 
-    const { idempotency_key, action_type, payload } =
-      typedAction as KonaSyncAction;
+    const normalizedAction = typedAction as KonaSyncAction;
+    await this.verifyIncomingSignature(normalizedAction.payload, envelope);
 
-    await this.verifyIncomingSignature(payload, envelope);
+    return { action: normalizedAction };
+  }
 
-    const isDuplicate = await IdempotencyRepository.checkAndRegisterKey(
-      idempotency_key,
-    );
+  private static async executePreparedAction(
+    preparedAction: PreparedSyncAction,
+    trx: Knex.Transaction,
+  ): Promise<PostCommitAction | undefined> {
+    const { idempotency_key, action_type, payload } = preparedAction.action;
+    const isDuplicate = await IdempotencyRepository.checkAndRegisterKey(idempotency_key, trx);
     if (isDuplicate) {
       console.warn(
         `[SyncController] Idempotency Hit! Action ${idempotency_key} already ` +
           `processed. Skipping duplicate.`,
       );
-      return;
+      return undefined;
     }
 
     console.log(
@@ -207,36 +243,57 @@ export class SyncController {
         `with key: ${idempotency_key}`,
     );
 
-    try {
-      switch (action_type) {
-        case 'CREATE_TRIP':
-          await this.handleCreateTrip(payload);
-          break;
+    let postCommitAction: PostCommitAction | undefined;
+    switch (action_type) {
+      case 'CREATE_TRIP':
+        await TripRepository.createTripRecord(payload, trx);
+        break;
 
-        case 'START_RIDE':
-          await this.handleStartRide(payload);
-          break;
-
-        case 'UPDATE_FARE':
-          await this.handleUpdateFare(payload);
-          break;
-
-        case 'END_RIDE':
-          await this.handleEndRide(payload);
-          break;
-
-        default:
-          const exhaustiveCheck: never = action_type;
-          throw new Error(
-            `[SyncController] Unhandled action type received: ${exhaustiveCheck}`,
-          );
+      case 'START_RIDE': {
+        const tripId = this.getTripId(payload, 'START_RIDE');
+        await TripRepository.updateTripStatus(tripId, 'ACTIVE', trx);
+        postCommitAction = () => this.startBackgroundTracking(tripId);
+        break;
       }
-    } catch (error) {
-      await IdempotencyRepository.releaseKey(idempotency_key);
-      throw error;
+
+      case 'UPDATE_FARE': {
+        const tripId = this.getTripId(payload, 'UPDATE_FARE');
+        const amount = Number(payload.fare_amount ?? payload.final_fare ?? payload.fare_minor);
+        if (!Number.isFinite(amount)) {
+          throw new TypeError('[SyncController] UPDATE_FARE requires a numeric fare field.');
+        }
+        await TripRepository.updateTripFare(tripId, amount, trx);
+        break;
+      }
+
+      case 'END_RIDE': {
+        const tripId = this.getTripId(payload, 'END_RIDE');
+        await TripRepository.terminateTripLifecycle(tripId, payload, trx);
+        postCommitAction = () => this.stopBackgroundTracking();
+        break;
+      }
+
+      default:
+        const exhaustiveCheck: never = action_type;
+        throw new Error(
+          `[SyncController] Unhandled action type received: ${exhaustiveCheck}`,
+        );
     }
 
     console.log(`[SyncController] ✓ Action ${idempotency_key} completed successfully.`);
+    return postCommitAction;
+  }
+
+  private static async runPostCommitActions(
+    actions: PostCommitAction[],
+  ): Promise<void> {
+    for (const action of actions) {
+      try {
+        await action();
+      } catch (error) {
+        console.error('[SyncController] Post-commit lifecycle action failed:', error);
+      }
+    }
   }
 
   /**
@@ -297,32 +354,21 @@ export class SyncController {
     }
   }
 
-  /**
-   * Handles CREATE_TRIP action: writes a new trip assignment record.
-   */
-  private static async handleCreateTrip(
+  private static getTripId(
     payload: Record<string, unknown>,
-  ): Promise<void> {
-    await TripRepository.createTripRecord(payload);
-  }
-
-  /**
-   * Handles START_RIDE action: transitions trip from ASSIGNED to ACTIVE.
-   * Also triggers native background location tracking (Sprint 8.5).
-   */
-  private static async handleStartRide(
-    payload: Record<string, unknown>,
-  ): Promise<void> {
+    actionType: 'START_RIDE' | 'UPDATE_FARE' | 'END_RIDE',
+  ): string {
     const tripId = String(payload.order_id ?? payload.trip_id ?? '');
     if (!tripId) {
-      throw new TypeError('[SyncController] START_RIDE requires payload.order_id or payload.trip_id.');
+      throw new TypeError(
+        `[SyncController] ${actionType} requires payload.order_id or payload.trip_id.`,
+      );
     }
 
-    // Update trip status in database
-    await TripRepository.updateTripStatus(tripId, 'ACTIVE');
+    return tripId;
+  }
 
-    // Trigger native background GPS tracking (Sprint 8.5 – Lifecycle Binding)
-    // Using dynamic import to avoid loading expo dependencies at module init time
+  private static async startBackgroundTracking(tripId: string): Promise<void> {
     console.log(
       `[SyncController] 🚗 Activating native background telemetry stream for trip: ${tripId}`,
     );
@@ -339,39 +385,7 @@ export class SyncController {
     }
   }
 
-  /**
-   * Handles UPDATE_FARE action: updates the fare amount for a trip.
-   */
-  private static async handleUpdateFare(
-    payload: Record<string, unknown>,
-  ): Promise<void> {
-    const tripId = String(payload.order_id ?? payload.trip_id ?? '');
-    const amount = Number(payload.fare_amount ?? payload.final_fare ?? payload.fare_minor);
-
-    if (!tripId) {
-      throw new TypeError('[SyncController] UPDATE_FARE requires payload.order_id or payload.trip_id.');
-    }
-    if (!Number.isFinite(amount)) {
-      throw new TypeError('[SyncController] UPDATE_FARE requires a numeric fare field.');
-    }
-
-    await TripRepository.updateTripFare(tripId, amount);
-  }
-
-  /**
-   * Handles END_RIDE action: finalizes trip lifecycle and settlement ledger.
-   * Also deactivates native background location tracking (Sprint 8.5).
-   */
-  private static async handleEndRide(
-    payload: Record<string, unknown>,
-  ): Promise<void> {
-    const tripId = String(payload.order_id ?? payload.trip_id ?? '');
-    if (!tripId) {
-      throw new TypeError('[SyncController] END_RIDE requires payload.order_id or payload.trip_id.');
-    }
-
-    // Stop native background GPS tracking (Sprint 8.5 – Lifecycle Binding)
-    // Using dynamic import to avoid loading expo dependencies at module init time
+  private static async stopBackgroundTracking(): Promise<void> {
     console.log(
       '[SyncController] 🛑 Deactivating native background telemetry stream safely.',
     );
@@ -385,8 +399,5 @@ export class SyncController {
       );
       // Do not re-throw; finalize the trip even if tracking stop fails.
     }
-
-    // Finalize trip lifecycle and settlement
-    await TripRepository.terminateTripLifecycle(tripId, payload);
   }
 }

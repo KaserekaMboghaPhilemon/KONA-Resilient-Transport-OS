@@ -18,14 +18,21 @@
 // automock. Without this stub the real pg connection pool is created, keeping
 // the Node.js event loop alive after the suite and causing Jest to hang.
 jest.mock('../../database/knex', () => ({
-  knex: Object.assign(jest.fn().mockReturnValue({ where: jest.fn(), insert: jest.fn(), update: jest.fn(), select: jest.fn() }), {
-    transaction: jest.fn(),
+  knex: Object.assign(jest.fn(), {
+    transaction: jest.fn(
+      async (callback: (trx: object) => Promise<unknown>) => callback({}),
+    ),
   }),
 }));
 jest.mock('../../repositories/IdempotencyRepository');
 jest.mock('../../repositories/TripRepository');
 jest.mock('../../repositories/DriverSecretRepository');
-jest.mock('../../services/BackgroundLocationWorker');
+jest.mock('../../services/BackgroundLocationWorker', () => ({
+  BackgroundLocationWorker: {
+    startTracking: jest.fn(),
+    stopTracking: jest.fn(),
+  },
+}));
 
 import { SyncController } from '../SyncController';
 import { IdempotencyRepository } from '../../repositories/IdempotencyRepository';
@@ -33,6 +40,7 @@ import { TripRepository } from '../../repositories/TripRepository';
 import { DriverSecretRepository } from '../../repositories/DriverSecretRepository';
 import { BackgroundLocationWorker } from '../../services/BackgroundLocationWorker';
 import { CryptoSignatureEngine } from '../../services/CryptoSignatureEngine';
+import { ServerLedgerReconciler } from '../../services/ServerLedgerReconciler';
 
 const mockIdempotencyRepository = IdempotencyRepository as jest.Mocked<typeof IdempotencyRepository>;
 const mockTripRepository = TripRepository as jest.Mocked<typeof TripRepository>;
@@ -41,6 +49,7 @@ const mockBackgroundLocationWorker = BackgroundLocationWorker as jest.Mocked<typ
 
 describe('SyncController – Sprint 8.5 Lifecycle Binding Tests', () => {
   beforeEach(() => {
+    jest.restoreAllMocks();
     jest.clearAllMocks();
     mockIdempotencyRepository.checkAndRegisterKey.mockResolvedValue(false);
     mockIdempotencyRepository.releaseKey.mockResolvedValue(undefined);
@@ -113,7 +122,11 @@ describe('SyncController – Sprint 8.5 Lifecycle Binding Tests', () => {
       await SyncController.executeAction(action);
 
       // Verify trip status was updated to ACTIVE
-      expect(mockTripRepository.updateTripStatus).toHaveBeenCalledWith('trip-123', 'ACTIVE');
+      expect(mockTripRepository.updateTripStatus).toHaveBeenCalledWith(
+        'trip-123',
+        'ACTIVE',
+        expect.anything(),
+      );
 
       // Verify background tracking was started with the trip ID
       expect(mockBackgroundLocationWorker.startTracking).toHaveBeenCalledWith('trip-123');
@@ -138,7 +151,11 @@ describe('SyncController – Sprint 8.5 Lifecycle Binding Tests', () => {
       await expect(SyncController.executeAction(action)).resolves.not.toThrow();
 
       // Trip status should still be updated
-      expect(mockTripRepository.updateTripStatus).toHaveBeenCalledWith('trip-456', 'ACTIVE');
+      expect(mockTripRepository.updateTripStatus).toHaveBeenCalledWith(
+        'trip-456',
+        'ACTIVE',
+        expect.anything(),
+      );
 
       // Tracking was attempted but failed gracefully
       expect(mockBackgroundLocationWorker.startTracking).toHaveBeenCalledWith('trip-456');
@@ -159,13 +176,17 @@ describe('SyncController – Sprint 8.5 Lifecycle Binding Tests', () => {
 
       await SyncController.executeAction(action);
 
-      expect(mockTripRepository.updateTripStatus).toHaveBeenCalledWith('trip-789', 'ACTIVE');
+      expect(mockTripRepository.updateTripStatus).toHaveBeenCalledWith(
+        'trip-789',
+        'ACTIVE',
+        expect.anything(),
+      );
       expect(mockBackgroundLocationWorker.startTracking).toHaveBeenCalledWith('trip-789');
     });
   });
 
   describe('END_RIDE action – stop background location tracking', () => {
-    it('should call BackgroundLocationWorker.stopTracking before finalizing trip', async () => {
+    it('should stop background tracking after finalizing the trip transaction', async () => {
       mockBackgroundLocationWorker.stopTracking.mockResolvedValue(undefined);
       mockTripRepository.terminateTripLifecycle.mockResolvedValue(undefined);
 
@@ -192,6 +213,7 @@ describe('SyncController – Sprint 8.5 Lifecycle Binding Tests', () => {
           driver_id: 'driver-xyz',
           final_fare: 25.5,
         }),
+        expect.anything(),
       );
     });
 
@@ -218,6 +240,7 @@ describe('SyncController – Sprint 8.5 Lifecycle Binding Tests', () => {
       expect(mockTripRepository.terminateTripLifecycle).toHaveBeenCalledWith(
         'trip-456',
         expect.any(Object),
+        expect.anything(),
       );
     });
 
@@ -240,6 +263,7 @@ describe('SyncController – Sprint 8.5 Lifecycle Binding Tests', () => {
       expect(mockTripRepository.terminateTripLifecycle).toHaveBeenCalledWith(
         'trip-789',
         expect.any(Object),
+        expect.anything(),
       );
     });
   });
@@ -262,6 +286,65 @@ describe('SyncController – Sprint 8.5 Lifecycle Binding Tests', () => {
       // Should not attempt any repository operations
       expect(mockTripRepository.updateTripStatus).not.toHaveBeenCalled();
       expect(mockBackgroundLocationWorker.startTracking).not.toHaveBeenCalled();
+    });
+
+    describe('verified batch transaction execution', () => {
+      it('executes reconciled rows in verified order on one transaction handle', async () => {
+        const createAction = {
+          idempotency_key: 'batch-create',
+          action_type: 'CREATE_TRIP',
+          payload: { order_id: 'trip-batch', driver_id: 'driver-xyz' },
+        };
+        const startAction = {
+          idempotency_key: 'batch-start',
+          action_type: 'START_RIDE',
+          payload: { order_id: 'trip-batch', driver_id: 'driver-xyz' },
+        };
+        const orderedRows = [
+          {
+            id: 1,
+            payload: JSON.stringify(createAction),
+            previous_row_hash: 'GENESIS',
+            row_signature: 'SIG-1',
+          },
+          {
+            id: 2,
+            payload: JSON.stringify(startAction),
+            previous_row_hash: 'SIG-1',
+            row_signature: 'SIG-2',
+          },
+        ];
+
+        jest.spyOn(ServerLedgerReconciler, 'verifyBatchSignature').mockReturnValue(true);
+        jest.spyOn(ServerLedgerReconciler, 'verifyIncomingChain').mockResolvedValue({
+          success: true,
+          orderedRows,
+        });
+
+        const result = await SyncController.ingestOfflineLedgerBatch({
+          driverId: 'driver-xyz',
+          deviceId: 'device-xyz',
+          rows: [...orderedRows].reverse(),
+          batchSignatureHex: 'signature',
+          lastValidServerHash: null,
+        });
+
+        expect(result).toEqual({ success: true, acceptedRows: 2 });
+        expect(mockIdempotencyRepository.checkAndRegisterKey.mock.calls.map(([key]) => key))
+          .toEqual(['batch-create', 'batch-start']);
+
+        const trx = mockIdempotencyRepository.checkAndRegisterKey.mock.calls[0][1];
+        expect(mockIdempotencyRepository.checkAndRegisterKey.mock.calls[1][1]).toBe(trx);
+        expect(mockTripRepository.createTripRecord).toHaveBeenCalledWith(
+          createAction.payload,
+          trx,
+        );
+        expect(mockTripRepository.updateTripStatus).toHaveBeenCalledWith(
+          'trip-batch',
+          'ACTIVE',
+          trx,
+        );
+      });
     });
   });
 
@@ -353,8 +436,8 @@ describe('SyncController – Sprint 8.5 Lifecycle Binding Tests', () => {
     });
   });
 
-  describe('Idempotency key cleanup on error', () => {
-    it('should release idempotency key if action handler throws', async () => {
+  describe('Idempotency rollback on error', () => {
+    it('should rely on transaction rollback rather than manually releasing the key', async () => {
       mockIdempotencyRepository.checkAndRegisterKey.mockResolvedValue(false);
       mockTripRepository.updateTripStatus.mockRejectedValue(
         new Error('Database connection failed'),
@@ -372,7 +455,13 @@ describe('SyncController – Sprint 8.5 Lifecycle Binding Tests', () => {
       await expect(SyncController.executeAction(action)).rejects.toThrow();
 
       // Idempotency key should be released so the action can be retried
-      expect(mockIdempotencyRepository.releaseKey).toHaveBeenCalledWith('idem-error');
+      expect(mockIdempotencyRepository.releaseKey).not.toHaveBeenCalled();
+      const trx = mockIdempotencyRepository.checkAndRegisterKey.mock.calls[0][1];
+      expect(mockTripRepository.updateTripStatus).toHaveBeenCalledWith(
+        'trip-123',
+        'ACTIVE',
+        trx,
+      );
     });
   });
 });
