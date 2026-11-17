@@ -9,6 +9,8 @@ services:
       PORT: 3000
       DATABASE_URL: postgres://${POSTGRES_USER:-kona}:${POSTGRES_PASSWORD:-kona-local-dev}@postgres:5432/${POSTGRES_DB:-kona}
       REDIS_URL: redis://redis:6379
+      TS_NODE_PROJECT: tsconfig.dev.json
+      TS_NODE_TRANSPILE_ONLY: "true"
     ports:
       - "3000:3000"
     depends_on:
