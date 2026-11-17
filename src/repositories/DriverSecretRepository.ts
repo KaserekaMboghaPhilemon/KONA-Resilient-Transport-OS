@@ -4,6 +4,11 @@ interface DriverSecretRow {
   secret_key: string;
 }
 
+export interface DriverAuthenticationRecord {
+  driver_id: string;
+  secret_key: string;
+}
+
 /**
  * Provides driver-scoped authentication secrets used for SMS signature checks.
  */
@@ -27,6 +32,29 @@ export class DriverSecretRepository {
     } catch (error) {
       console.error('[DriverSecretRepository] Failed to fetch driver secret:', error);
       return null;
+    }
+  }
+
+  public static async getAuthenticationByPhone(
+    phoneNumber: string,
+  ): Promise<DriverAuthenticationRecord | null> {
+    const normalized = phoneNumber.trim();
+    if (!normalized) {
+      return null;
+    }
+
+    try {
+      const row = await knex('drivers')
+        .join('driver_auth_secrets', 'drivers.driver_id', 'driver_auth_secrets.driver_id')
+        .where({ 'drivers.phone_e164': normalized })
+        .first<DriverAuthenticationRecord>('drivers.driver_id', 'driver_auth_secrets.secret_key');
+      if (!row || !row.driver_id || !row.secret_key?.trim()) {
+        return null;
+      }
+      return row;
+    } catch (error) {
+      console.error('[DriverSecretRepository] Failed to fetch driver authentication by phone:', error);
+      throw error;
     }
   }
 }

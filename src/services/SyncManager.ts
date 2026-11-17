@@ -12,7 +12,7 @@
  *
  *   2. SMS path    — when internet is entirely unavailable but an SMS gateway
  *      link is detected. Encodes the payload through the Sprint 3 Base45
- *      TelephonyBridge and dispatches it via the device's native SMS channel.
+ *      Base45-encodes a canonical action envelope and dispatches it via native SMS.
  *
  * Retry circuitry:
  *   Each transmission failure increments the entry's attempt_count via
@@ -40,7 +40,11 @@ import {
   type QueueEntry,
 } from '../db/LocalDatabase';
 
-import { encodeActionToSMS } from '../utils/TelephonyBridge';
+import {
+  base45Decode,
+  encodeQueuedActionToSMS,
+  utf8Decode,
+} from '../utils/TelephonyBridge';
 
 import { SQLiteSyncRepository, type SyncQueueRow } from './SQLiteSyncRepository';
 
@@ -149,7 +153,7 @@ export interface HttpsTransportAdapter {
 
 /**
  * Injectable SMS gateway adapter. The SyncManager calls this with the
- * Base45-encoded wire string produced by TelephonyBridge.encodeActionToSMS().
+ * Base45-encoded canonical action envelope produced by TelephonyBridge.
  * The adapter owns the native telephony channel interaction.
  *
  * The adapter MUST:
@@ -157,7 +161,7 @@ export interface HttpsTransportAdapter {
  *  – Throw (or return false) if the channel is unavailable or the send fails.
  */
 export interface SmsSenderAdapter {
-  send(wireString: string): Promise<boolean>;
+  send(wireString: string, deviceSecret?: string): Promise<boolean>;
 }
 
 // ---------------------------------------------------------------------------
@@ -526,7 +530,7 @@ export class SyncManager {
   // -------------------------------------------------------------------------
 
   /**
-   * Encodes the payload through TelephonyBridge.encodeActionToSMS() and
+   * Encodes the payload through TelephonyBridge.encodeQueuedActionToSMS() and
    * dispatches the resulting Base45 wire string via the injected SMS adapter.
    *
    * The SMS channel does not provide application-layer delivery confirmation,
@@ -546,7 +550,8 @@ export class SyncManager {
     try {
       const decompressed = await decompressQueueEntry(entry);
 
-      const wireString = encodeActionToSMS(
+      const wireString = encodeQueuedActionToSMS(
+        entry.idempotency_key,
         entry.order_id,
         entry.action_type,
         decompressed.payload,
@@ -740,9 +745,12 @@ export async function runSprint4Verification(): Promise<void> {
 
   const mockSmsAdapter: SmsSenderAdapter = {
     async send(wireString): Promise<boolean> {
-      smsCallLog.push(wireString.slice(0, 10) + '…');
+      const action = JSON.parse(utf8Decode(base45Decode(wireString))) as {
+        action_type: string;
+      };
+      smsCallLog.push(action.action_type);
       // Entry 'F' (dispatch_offer_response) always fails on SMS.
-      if (wireString.startsWith('KDO')) {
+      if (action.action_type === 'DISPATCH_OFFER_RESPONSE') {
         throw new Error('SMS gateway timeout (simulated)');
       }
       return true;
@@ -941,7 +949,8 @@ export async function runSprint4Verification(): Promise<void> {
 
       // sms_only
       try {
-        const wireString = encodeActionToSMS(
+        const wireString = encodeQueuedActionToSMS(
+          entry.idempotency_key,
           entry.order_id,
           entry.action_type,
           entry.raw_payload,
@@ -1022,7 +1031,7 @@ export async function runSprint4Verification(): Promise<void> {
   const ikey_F = phase3Results.find((r) => r.idempotency_key === 'ikey-F');
   assert(ikey_E?.outcome === 'synced_sms', 'Phase 3: entry E must be synced via SMS');
   assert(ikey_F?.outcome === 'failed_permanently', 'Phase 3: entry F must be permanently failed at ceiling');
-  assert(smsCallLog.some((s) => s.startsWith('KOS')), 'Phase 3: SMS call log must contain a KOS (order_status_update) wire string');
+  assert(smsCallLog.includes('ORDER_STATUS_UPDATE'), 'Phase 3: SMS call log must contain ORDER_STATUS_UPDATE');
 
   // ---------------------------------------------------------------------------
   // Verification log

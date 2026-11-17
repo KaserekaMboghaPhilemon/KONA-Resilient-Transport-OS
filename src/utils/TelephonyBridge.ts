@@ -82,16 +82,15 @@ const BASE45_REVERSE: Readonly<Record<string, number>> = Object.freeze(
 /**
  * Encodes a Uint8Array to a Base45 string following RFC 9285 §4.
  *
- * Each pair of input bytes is treated as a 16-bit little-endian integer
- * and encoded into 3 Base45 characters.  A trailing single byte is encoded
+ * Each pair of input bytes is treated as a 16-bit big-endian integer
+ * and encoded into 3 Base45 characters. A trailing single byte is encoded
  * into 2 Base45 characters.  All output characters belong to BASE45_ALPHABET.
  */
 export function base45Encode(bytes: Uint8Array): string {
   let out = '';
   for (let i = 0; i < bytes.length; i += 2) {
     if (i + 1 < bytes.length) {
-      // Little-endian 16-bit value per RFC 9285: low byte first.
-      const n = bytes[i] + bytes[i + 1] * 256;
+      const n = bytes[i] * 256 + bytes[i + 1];
       out +=
         BASE45_ALPHABET[n % 45] +
         BASE45_ALPHABET[Math.floor(n / 45) % 45] +
@@ -152,7 +151,7 @@ export function base45Decode(encoded: string): Uint8Array {
             `which exceeds the 16-bit maximum of 65535.`,
         );
       }
-      bytes.push(n % 256, Math.floor(n / 256));
+      bytes.push(Math.floor(n / 256), n % 256);
     } else {
       // Trailing 2-character group decodes to exactly 1 byte.
       const n = c0 + c1 * 45;
@@ -476,6 +475,27 @@ export interface DecodedSMSAction {
    * reconstructs account-level details from the order_id.
    */
   payload: Record<string, unknown>;
+}
+
+export function encodeQueuedActionToSMS(
+  idempotencyKey: string,
+  orderId: string,
+  actionType: OfflineActionType,
+  payload: Record<string, unknown>,
+): string {
+  if (!idempotencyKey.trim()) {
+    throw new TypeError('[encodeQueuedActionToSMS] idempotencyKey must not be empty.');
+  }
+  if (!orderId.trim()) {
+    throw new TypeError('[encodeQueuedActionToSMS] orderId must not be empty.');
+  }
+
+  const action = {
+    idempotency_key: idempotencyKey,
+    action_type: actionType.toUpperCase(),
+    payload: { ...payload, order_id: orderId },
+  };
+  return base45Encode(utf8Encode(JSON.stringify(action)));
 }
 
 // ---------------------------------------------------------------------------

@@ -44,7 +44,12 @@ jest.mock('../CryptoSignatureEngine', () => ({
 }));
 
 import * as SMS from 'expo-sms';
+import base45 from 'base45';
 import { SMSTransportManager } from '../SMSTransportManager';
+import { encodeQueuedActionToSMS } from '../../utils/TelephonyBridge';
+import { base45Decode, utf8Decode } from '../../utils/TelephonyBridge';
+import { CryptoSignatureEngine } from '../CryptoSignatureEngine';
+import { SMSReassemblyManager } from '../SMSReassemblyManager';
 
 // Narrow the mock type so TypeScript recognises .mock and .mockResolvedValue.
 const mockSMS = SMS as jest.Mocked<typeof SMS>;
@@ -60,6 +65,7 @@ const CH_MAX_LEN = 160;
 
 /** Signature fixture used by SMSTransportManager mock signing path. */
 const SIGNATURE_HEX = 'A1B2C3D4';
+const TEST_DEVICE_SECRET = 'test-device-secret';
 
 /**
  * Bytes reserved for the KONA tracking header in signed format.
@@ -134,6 +140,7 @@ beforeEach(() => {
   // which would cause stale mockResolvedValueOnce entries to contaminate
   // subsequent tests that rely on mockImplementation or mockRejectedValue.)
   jest.resetAllMocks();
+  (CryptoSignatureEngine.generateSignature as jest.Mock).mockResolvedValue(SIGNATURE_HEX);
 
   // Default happy-path configuration.  Individual tests override as needed.
   mockSMS.isAvailableAsync.mockResolvedValue(true);
@@ -180,11 +187,60 @@ describe('1 — create() factory initialisation', () => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe('2 — send() single-frame transmission', () => {
+  it('encodes queued actions as Base45 JSON with idempotency and uppercase action type', () => {
+    const wire = encodeQueuedActionToSMS(
+      'idem-001',
+      'order-001',
+      'booking_lock',
+      { fare_minor: 4500 },
+    );
+    const action = JSON.parse(utf8Decode(base45Decode(wire)));
+
+    expect(action).toEqual({
+      idempotency_key: 'idem-001',
+      action_type: 'BOOKING_LOCK',
+      payload: { fare_minor: 4500, order_id: 'order-001' },
+    });
+  });
+
+  it('round-trips an encoded queued action through the SMS frame reassembler', async () => {
+    const wire = encodeQueuedActionToSMS(
+      'idem-roundtrip',
+      'order-roundtrip',
+      'trip_settlement',
+      { fare_minor: 4500 },
+    );
+    const frames = SMSTransportManager.chunkify(wire, 'AB12', SIGNATURE_HEX);
+    let decoded: Record<string, unknown> | null = null;
+    for (const frame of frames) {
+      decoded = await SMSReassemblyManager.processIncomingSegment(
+        '+254700000001',
+        frame,
+      );
+    }
+
+    expect(decoded).toMatchObject({
+      idempotency_key: 'idem-roundtrip',
+      action_type: 'TRIP_SETTLEMENT',
+      payload: { fare_minor: 4500, order_id: 'order-roundtrip' },
+      __kona_signature_hex: SIGNATURE_HEX,
+      __kona_raw_wire: wire,
+      __kona_sender: '+254700000001',
+    });
+  });
+
+  it('refuses to transmit when no device signing secret is provided', async () => {
+    const adapter = await SMSTransportManager.create();
+
+    await expect(adapter.send('base45-data')).resolves.toBe(false);
+    expect(mockSMS.sendSMSAsync).not.toHaveBeenCalled();
+  });
+
   it('returns true when the single frame is accepted by the gateway', async () => {
     const adapter    = await SMSTransportManager.create();
     const wireString = buildWireString(80); // 80 chars < DATA_PER_CHUNK (140)
 
-    const result = await adapter.send(wireString);
+    const result = await adapter.send(wireString, TEST_DEVICE_SECRET);
 
     expect(result).toBe(true);
   });
@@ -193,7 +249,7 @@ describe('2 — send() single-frame transmission', () => {
     const adapter    = await SMSTransportManager.create();
     const wireString = buildWireString(DATA_PER_CHUNK); // exactly 140 chars
 
-    await adapter.send(wireString);
+    await adapter.send(wireString, TEST_DEVICE_SECRET);
 
     expect(mockSMS.sendSMSAsync).toHaveBeenCalledTimes(1);
   });
@@ -202,7 +258,7 @@ describe('2 — send() single-frame transmission', () => {
     const adapter    = await SMSTransportManager.create();
     const wireString = buildWireString(50);
 
-    await adapter.send(wireString);
+    await adapter.send(wireString, TEST_DEVICE_SECRET);
 
     const [addresses] = mockSMS.sendSMSAsync.mock.calls[0] as [string[], string];
     expect(addresses).toEqual([GATEWAY_NUMBER]);
@@ -212,7 +268,7 @@ describe('2 — send() single-frame transmission', () => {
     const adapter    = await SMSTransportManager.create();
     const wireString = buildWireString(60);
 
-    await adapter.send(wireString);
+    await adapter.send(wireString, TEST_DEVICE_SECRET);
 
     const [, frameBody] = mockSMS.sendSMSAsync.mock.calls[0] as [string[], string];
     const parsed        = parseFrame(frameBody);
@@ -227,7 +283,7 @@ describe('2 — send() single-frame transmission', () => {
     const adapter    = await SMSTransportManager.create();
     const wireString = buildWireString(100);
 
-    await adapter.send(wireString);
+    await adapter.send(wireString, TEST_DEVICE_SECRET);
 
     const [, frameBody] = mockSMS.sendSMSAsync.mock.calls[0] as [string[], string];
     const parsed        = parseFrame(frameBody);
@@ -239,7 +295,7 @@ describe('2 — send() single-frame transmission', () => {
     const adapter    = await SMSTransportManager.create();
     const wireString = buildWireString(40);
 
-    await adapter.send(wireString);
+    await adapter.send(wireString, TEST_DEVICE_SECRET);
 
     const [, frameBody] = mockSMS.sendSMSAsync.mock.calls[0] as [string[], string];
     const parsed        = parseFrame(frameBody);
@@ -252,7 +308,7 @@ describe('2 — send() single-frame transmission', () => {
     // Use a wire string at the maximum data boundary.
     const wireString = buildWireString(DATA_PER_CHUNK);
 
-    await adapter.send(wireString);
+    await adapter.send(wireString, TEST_DEVICE_SECRET);
 
     const [, frameBody] = mockSMS.sendSMSAsync.mock.calls[0] as [string[], string];
     expect(frameBody.length).toBeLessThanOrEqual(CH_MAX_LEN);
@@ -352,7 +408,7 @@ describe('3 — chunkify() multi-frame chunk splicing', () => {
     // 3 chunks: 420 chars of data.
     const wireString = buildWireString(3 * DATA_PER_CHUNK);
 
-    await adapter.send(wireString);
+    await adapter.send(wireString, TEST_DEVICE_SECRET);
 
     expect(mockSMS.sendSMSAsync).toHaveBeenCalledTimes(3);
   });
@@ -361,7 +417,7 @@ describe('3 — chunkify() multi-frame chunk splicing', () => {
     const adapter    = await SMSTransportManager.create();
     const wireString = buildWireString(3 * DATA_PER_CHUNK);
 
-    await adapter.send(wireString);
+    await adapter.send(wireString, TEST_DEVICE_SECRET);
 
     for (const callArgs of mockSMS.sendSMSAsync.mock.calls) {
       const [addresses] = callArgs as [string[], string];
@@ -373,7 +429,7 @@ describe('3 — chunkify() multi-frame chunk splicing', () => {
     const adapter    = await SMSTransportManager.create();
     const wireString = buildWireString(3 * DATA_PER_CHUNK);
 
-    const result = await adapter.send(wireString);
+    const result = await adapter.send(wireString, TEST_DEVICE_SECRET);
 
     expect(result).toBe(true);
   });
@@ -401,7 +457,7 @@ describe('4 — send() failure transmission defences', () => {
     const adapter    = await SMSTransportManager.create();
     const wireString = buildWireString(50);
 
-    const result = await adapter.send(wireString);
+    const result = await adapter.send(wireString, TEST_DEVICE_SECRET);
 
     expect(result).toBe(false);
   });
@@ -416,7 +472,7 @@ describe('4 — send() failure transmission defences', () => {
     // 2 chunks: > 140 chars, ≤ 280 chars.
     const wireString = buildWireString(DATA_PER_CHUNK + 40);
 
-    const result = await adapter.send(wireString);
+    const result = await adapter.send(wireString, TEST_DEVICE_SECRET);
 
     expect(result).toBe(false);
     // Pipeline must have called sendSMSAsync exactly twice: once for the
@@ -434,7 +490,7 @@ describe('4 — send() failure transmission defences', () => {
     const adapter    = await SMSTransportManager.create();
     const wireString = buildWireString(3 * DATA_PER_CHUNK);
 
-    await adapter.send(wireString);
+    await adapter.send(wireString, TEST_DEVICE_SECRET);
 
     // Only 2 calls expected: the loop throws after frame 2 and frame 3 is skipped.
     expect(mockSMS.sendSMSAsync).toHaveBeenCalledTimes(2);
@@ -448,7 +504,7 @@ describe('4 — send() failure transmission defences', () => {
     const adapter    = await SMSTransportManager.create();
     const wireString = buildWireString(50);
 
-    const result = await adapter.send(wireString);
+    const result = await adapter.send(wireString, TEST_DEVICE_SECRET);
 
     expect(result).toBe(false);
   });
@@ -459,7 +515,7 @@ describe('4 — send() failure transmission defences', () => {
     const adapter    = await SMSTransportManager.create();
     const wireString = buildWireString(50);
 
-    const result = await adapter.send(wireString);
+    const result = await adapter.send(wireString, TEST_DEVICE_SECRET);
 
     expect(result).toBe(false);
   });
@@ -470,7 +526,7 @@ describe('4 — send() failure transmission defences', () => {
     const adapter    = await SMSTransportManager.create();
     const wireString = buildWireString(50);
 
-    await expect(adapter.send(wireString)).resolves.toBe(false);
+    await expect(adapter.send(wireString, TEST_DEVICE_SECRET)).resolves.toBe(false);
   });
 });
 
@@ -545,7 +601,7 @@ describe('6 — transmitPayloadViaSMS() legacy direct-dispatch', () => {
     const result = await SMSTransportManager.transmitPayloadViaSMS({
       driverId: 'DRV-001',
       status:   'idle',
-    });
+    }, TEST_DEVICE_SECRET);
 
     expect(result).toBe(false);
   });
@@ -556,7 +612,7 @@ describe('6 — transmitPayloadViaSMS() legacy direct-dispatch', () => {
     const result = await SMSTransportManager.transmitPayloadViaSMS({
       driverId: 'DRV-007',
       amount:   2500,
-    });
+    }, TEST_DEVICE_SECRET);
 
     expect(result).toBe(true);
     expect(mockSMS.sendSMSAsync).toHaveBeenCalled();
@@ -568,7 +624,7 @@ describe('6 — transmitPayloadViaSMS() legacy direct-dispatch', () => {
     const result = await SMSTransportManager.transmitPayloadViaSMS({
       driverId: 'DRV-007',
       amount:   2500,
-    });
+    }, TEST_DEVICE_SECRET);
 
     expect(result).toBe(false);
   });
@@ -577,7 +633,7 @@ describe('6 — transmitPayloadViaSMS() legacy direct-dispatch', () => {
     await SMSTransportManager.transmitPayloadViaSMS({
       driverId: 'DRV-001',
       status:   'active',
-    });
+    }, TEST_DEVICE_SECRET);
 
     const [, frameBody] = mockSMS.sendSMSAsync.mock.calls[0] as [string[], string];
     // The frame data must contain the compressed key 'd' not the raw 'driverId'.
@@ -586,7 +642,7 @@ describe('6 — transmitPayloadViaSMS() legacy direct-dispatch', () => {
   });
 
   it('calls isAvailableAsync exactly once per invocation', async () => {
-    await SMSTransportManager.transmitPayloadViaSMS({ amount: 100 });
+    await SMSTransportManager.transmitPayloadViaSMS({ amount: 100 }, TEST_DEVICE_SECRET);
 
     expect(mockSMS.isAvailableAsync).toHaveBeenCalledTimes(1);
   });

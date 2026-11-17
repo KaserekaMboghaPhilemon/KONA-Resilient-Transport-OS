@@ -334,6 +334,29 @@ POST /api/v1/sms/gateway-webhook
 
 ---
 
+### 5.3.1 Sprint 20.4 — HTTP, Telemetry, and SMS Contracts
+
+- Configure clients with `KONA_API_BASE_URL` or `EXPO_PUBLIC_KONA_API_BASE_URL`;
+  there is no localhost fallback. The Express listener binds to `HOST` or
+  `0.0.0.0`.
+- Offline actions POST to `/api/v1/sync/action`. The server normalizes action
+  names to uppercase, inserts the top-level `order_id` into `payload`, and
+  executes the shared idempotent controller contract. The verified offline
+  ledger action names are `BOOKING_LOCK`, `BOOKING_REVERSAL`,
+  `TRIP_SETTLEMENT`, `ORDER_STATUS_UPDATE`, `DRIVER_LOCATION_UPDATE`, and
+  `DISPATCH_OFFER_RESPONSE`.
+- Telemetry batches POST to `/api/v1/telemetry/batch`; `payload_b45` contains
+  `trip_id|lat,lng,speed,timestamp;...`. The server validates and stores the
+  decoded points in `trip_telemetry_points`. Apply the telemetry migration
+  after the runtime migration that creates `trips`.
+- SMS action and telemetry envelopes are JSON encoded with RFC 9285 Base45,
+  split into signed `KONA:TXID:N/T:SIG:DATA` frames, and reassembled before
+  dispatch. SMS senders must have a configured device secret; no unsigned or
+  hardcoded fallback signature is generated. The gateway sender is resolved
+  to its driver authentication secret before execution.
+
+---
+
 ### 5.3 SMSReassemblyManager.ts — Frame Accumulation & Decode
 
 **Purpose:** Accumulate multi-frame SMS segments, reassemble Base45, decode JSON.

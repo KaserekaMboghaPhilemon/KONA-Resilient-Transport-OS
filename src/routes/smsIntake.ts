@@ -34,6 +34,9 @@
 import { Router, Request, Response } from 'express';
 import { SMSReassemblyManager } from '../services/SMSReassemblyManager';
 import { SignatureAuthenticationError, SyncController } from '../controllers/SyncController';
+import { DriverSecretRepository } from '../repositories/DriverSecretRepository';
+import { CryptoSignatureEngine } from '../services/CryptoSignatureEngine';
+import { storeTelemetryBatch, type TelemetryBatchBody } from './telemetry';
 
 // ---------------------------------------------------------------------------
 // Type definitions
@@ -116,6 +119,40 @@ router.post(
 
       // ── Response dispatch ───────────────────────────────────────────────
       if (payload !== null) {
+        if (payload.message_type === 'TELEMETRY_BATCH') {
+          const signature =
+            typeof payload.__kona_signature_hex === 'string'
+              ? payload.__kona_signature_hex
+              : '';
+          const rawWire =
+            typeof payload.__kona_raw_wire === 'string' ? payload.__kona_raw_wire : '';
+          const authentication = await DriverSecretRepository.getAuthenticationByPhone(sender);
+          if (!signature || !rawWire || !authentication) {
+            throw new SignatureAuthenticationError(
+              '[smsIntake] Missing telemetry signature or registered driver identity.',
+            );
+          }
+          const expectedSignature = await CryptoSignatureEngine.generateSignature(
+            rawWire,
+            authentication.secret_key,
+          );
+          if (signature !== expectedSignature) {
+            throw new SignatureAuthenticationError(
+              '[smsIntake] Telemetry signature verification failed.',
+            );
+          }
+
+          await storeTelemetryBatch(
+            payload as unknown as TelemetryBatchBody,
+            authentication.driver_id,
+          );
+          res.status(200).json({
+            status: 'ok',
+            message: 'Telemetry batch reassembled and stored.',
+          });
+          return;
+        }
+
         // All segments received — payload fully decoded. Trigger ledger pipeline.
         await SyncController.executeAction(payload);
 

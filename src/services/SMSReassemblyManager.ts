@@ -180,6 +180,7 @@ export class SMSReassemblyManager {
       // Pass signed-wire metadata downstream for server-side authentication.
       payload.__kona_signature_hex = record.signatureHex;
       payload.__kona_raw_wire = fullWireString;
+      payload.__kona_sender = record.sender;
 
       console.log(`[SMS Intake] Successfully reassembled and decoded TXID: ${txId}`);
 

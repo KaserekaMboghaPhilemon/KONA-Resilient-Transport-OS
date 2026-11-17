@@ -23,15 +23,12 @@ export interface SMSChunk {
 // rather than attempting a raw Base45 wire-string delivery.
 //
 // Integration contract with SyncManager:
-//   SyncManager.processEntryViaSms() already calls
-//   TelephonyBridge.encodeActionToSMS() to produce a ≤160-char Base45 wire
-//   string, then passes it to SmsSenderAdapter.send(wireString).
-//   SMSTransportManager.send() receives that pre-encoded wire string, applies
+//   SyncManager.processEntryViaSms() Base45-encodes a canonical JSON action
+//   envelope and passes it with the device secret to SmsSenderAdapter.send().
+//   SMSTransportManager.send() signs the encoded action, applies
 //   the KONA:TXID:N/T: frame header via chunkify(), and fires each text
-//   frame sequentially through expo-sms.  For well-formed payloads the Base45
-//   wire string already fits in a single 160-char SMS window and chunkify()
-//   produces exactly one frame.  For edge-case oversized strings it splits
-//   them transparently across multiple sequential frames.
+//   frame sequentially through expo-sms. Large payloads may span multiple
+//   frames and are verified after reassembly.
 //
 // Factory method:
 //   Use SMSTransportManager.create() when building a SyncManager for
@@ -41,8 +38,6 @@ export interface SMSChunk {
 
 export class SMSTransportManager implements SmsSenderAdapter {
   private static readonly CH_MAX_LEN = 160;
-  private static readonly FALLBACK_DEVICE_SECRET = 'KONA_LOCAL_FALLBACK_SECRET';
-  private static readonly UNSIGNED_SIGNATURE = '00000000';
 
   /** E.164 number for the KONA Base Station Gateway. */
   private static readonly GATEWAY_NUMBER = '+254700000000';
@@ -70,8 +65,7 @@ export class SMSTransportManager implements SmsSenderAdapter {
   // -------------------------------------------------------------------------
 
   /**
-   * Accepts a pre-encoded wire string (produced by
-   * TelephonyBridge.encodeActionToSMS) from the SyncManager SMS path,
+   * Accepts a pre-encoded Base45 action envelope from the SyncManager SMS path,
    * wraps it in KONA frame headers via chunkify(), and dispatches each
    * text frame sequentially through expo-sms.
    *
@@ -80,11 +74,13 @@ export class SMSTransportManager implements SmsSenderAdapter {
    * retry circuitry can schedule a backoff and re-attempt delivery.
    */
   async send(wireString: string, deviceSecret?: string): Promise<boolean> {
+    if (!deviceSecret?.trim()) {
+      console.error('[SMSTransportManager] Refusing to send SMS without a device secret.');
+      return false;
+    }
+
     const txId = SMSTransportManager.generateTxId();
-    const signatureHex = await SMSTransportManager.signPayload(
-      wireString,
-      deviceSecret,
-    );
+    const signatureHex = await SMSTransportManager.signPayload(wireString, deviceSecret);
     const frames = SMSTransportManager.chunkify(wireString, txId, signatureHex);
 
     console.log(
@@ -144,7 +140,7 @@ export class SMSTransportManager implements SmsSenderAdapter {
    * direct dispatch paths that bypass TelephonyBridge.
    *
    * When invoked from the SyncManager path the payload has already been
-   * encoded by TelephonyBridge.encodeActionToSMS(); this method is therefore
+   * encoded by TelephonyBridge; this method is therefore
    * not called in that flow — it remains available for legacy callers and
    * standalone dispatch.
    */
@@ -173,14 +169,13 @@ export class SMSTransportManager implements SmsSenderAdapter {
   *   KONA:{TXID}:{N}/{TOTAL}:{SIG}:{DATA}
   * where SIG is an 8-char uppercase hex signature fragment.
    *
-   * For well-formed Base45 TelephonyBridge wire strings (≤160 chars) this
-   * always returns a single frame, making multi-chunk delivery a transparent
-   * safety net rather than a normal-path concern.
+   * Large Base45 JSON envelopes may span frames; their signature is checked
+   * after the gateway reassembles the original encoded envelope.
    */
   public static chunkify(
     encodedStr: string,
     transmissionId: string,
-    signatureHex: string = this.UNSIGNED_SIGNATURE,
+    signatureHex: string,
   ): string[] {
     if (!encodedStr) {
       return [];
@@ -220,8 +215,12 @@ export class SMSTransportManager implements SmsSenderAdapter {
    */
   public static async transmitPayloadViaSMS(
     payload: Record<string, unknown>,
-    deviceSecret?: string,
+    deviceSecret: string,
   ): Promise<boolean> {
+    if (!deviceSecret.trim()) {
+      throw new Error('[SMSTransportManager] A device secret is required for SMS signing.');
+    }
+
     const available = await SMS.isAvailableAsync();
     if (!available) {
       console.error('[SMSTransportManager] Telephony hardware interface unavailable on this device.');
@@ -269,7 +268,10 @@ export class SMSTransportManager implements SmsSenderAdapter {
   /** Ensures all frame signatures are normalized to 8 uppercase hex chars. */
   private static normalizeSignature(signatureHex: string): string {
     const candidate = signatureHex.trim().toUpperCase();
-    return /^[A-F0-9]{8}$/.test(candidate) ? candidate : this.UNSIGNED_SIGNATURE;
+    if (!/^[A-F0-9]{8}$/.test(candidate)) {
+      throw new TypeError('[SMSTransportManager] Invalid SMS signature format.');
+    }
+    return candidate;
   }
 
   /** Computes per-frame data capacity from dynamic header length. */
@@ -282,20 +284,7 @@ export class SMSTransportManager implements SmsSenderAdapter {
     return Math.max(1, this.CH_MAX_LEN - header.length);
   }
 
-  /** Generates an 8-char signature for a payload, with safe fallback behavior. */
-  private static async signPayload(payload: string, deviceSecret?: string): Promise<string> {
-    const secret = deviceSecret?.trim() || this.FALLBACK_DEVICE_SECRET;
-    if (!deviceSecret?.trim()) {
-      console.warn(
-        '[SMSTransportManager] deviceSecret missing, using fallback secret for signature generation.',
-      );
-    }
-
-    try {
-      return await CryptoSignatureEngine.generateSignature(payload, secret);
-    } catch (error) {
-      console.error('[SMSTransportManager] Signature generation failed. Falling back to UNSIGNED signature.', error);
-      return this.UNSIGNED_SIGNATURE;
-    }
+  private static async signPayload(payload: string, deviceSecret: string): Promise<string> {
+    return CryptoSignatureEngine.generateSignature(payload, deviceSecret);
   }
 }

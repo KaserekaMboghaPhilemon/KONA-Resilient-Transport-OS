@@ -27,6 +27,7 @@ jest.mock('../../controllers/SyncController', () => {
     SignatureAuthenticationError: MockSignatureAuthenticationError,
     SyncController: {
       ingestOfflineLedgerBatch: jest.fn(),
+      executeAction: jest.fn(),
     },
   };
 });
@@ -46,6 +47,27 @@ describe('POST /api/v1/sync/offline-batch', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+  });
+
+  it('accepts a single offline action using the controller action contract', async () => {
+    mockSyncController.executeAction.mockResolvedValue(undefined);
+
+    const res = await request(app)
+      .post('/api/v1/sync/action')
+      .send({
+        idempotency_key: 'http-idem-1',
+        order_id: 'order-1',
+        action_type: 'order_status_update',
+        payload: { status: 'in_trip' },
+      });
+
+    expect(res.status).toBe(200);
+    expect(mockSyncController.executeAction).toHaveBeenCalledWith({
+      idempotency_key: 'http-idem-1',
+      order_id: 'order-1',
+      action_type: 'ORDER_STATUS_UPDATE',
+      payload: { status: 'in_trip', order_id: 'order-1' },
+    });
   });
 
   it('returns 200 on successful reconciliation', async () => {

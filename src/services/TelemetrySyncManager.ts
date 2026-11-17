@@ -4,9 +4,9 @@ import base45 from 'base45';
 import { SQLiteTelemetryRepository, type TelemetryPing } from './SQLiteTelemetryRepository';
 import { SMSTransportManager } from './SMSTransportManager';
 import type { ConnectivityProbe, ConnectivityState } from './SyncManager';
+import { resolveApiBaseUrl } from './ApiConfig';
 
 const TELEMETRY_BATCH_LIMIT = 10;
-const DEFAULT_API_BASE_URL = 'http://localhost:3000';
 
 // ---------------------------------------------------------------------------
 // Task 9.4 – Periodic daemon configuration
@@ -24,7 +24,8 @@ interface TelemetryBatchPayload {
 
 interface TelemetrySyncDependencies {
   connectivityProbe: ConnectivityProbe;
-  apiBaseUrl: string;
+  apiBaseUrl?: string;
+  getDeviceSecret: () => Promise<string>;
 }
 
 /**
@@ -55,7 +56,9 @@ export class TelemetrySyncManager {
     connectivityProbe: {
       getState: () => 'none',
     },
-    apiBaseUrl: DEFAULT_API_BASE_URL,
+    getDeviceSecret: async () => {
+      throw new Error('[TelemetrySyncManager] Device secret provider is not configured.');
+    },
   };
 
   /**
@@ -365,7 +368,7 @@ export class TelemetrySyncManager {
     }
 
     if (state === 'sms_only' || state === 'none') {
-      return this.dispatchViaSms(encodedPayload);
+      return this.dispatchViaSms(tripId, encodedPayload, pointCount);
     }
 
     return false;
@@ -376,7 +379,7 @@ export class TelemetrySyncManager {
     encodedPayload: string,
     pointCount: number,
   ): Promise<boolean> {
-    const endpoint = `${this.dependencies.apiBaseUrl.replace(/\/$/, '')}/api/v1/telemetry/batch`;
+    const endpoint = `${(this.dependencies.apiBaseUrl ?? resolveApiBaseUrl()).replace(/\/$/, '')}/api/v1/telemetry/batch`;
 
     const payload: TelemetryBatchPayload = {
       trip_id: tripId,
@@ -407,10 +410,29 @@ export class TelemetrySyncManager {
     }
   }
 
-  private static async dispatchViaSms(encodedPayload: string): Promise<boolean> {
+  private static async dispatchViaSms(
+    tripId: string,
+    encodedPayload: string,
+    pointCount: number,
+  ): Promise<boolean> {
     try {
       const smsTransport = await SMSTransportManager.create();
-      return smsTransport.sendPayloadAsChunks(encodedPayload, 'TELEMETRY');
+      const envelope = base45.encode(
+        Buffer.from(
+          JSON.stringify({
+            message_type: 'TELEMETRY_BATCH',
+            trip_id: tripId,
+            payload_b45: encodedPayload,
+            point_count: pointCount,
+          }),
+          'utf8',
+        ),
+      );
+      return smsTransport.sendPayloadAsChunks(
+        envelope,
+        'TELEMETRY',
+        await this.dependencies.getDeviceSecret(),
+      );
     } catch (smsError) {
       console.error('[TelemetrySyncManager] SMS telemetry batch transport failed:', smsError);
       return false;

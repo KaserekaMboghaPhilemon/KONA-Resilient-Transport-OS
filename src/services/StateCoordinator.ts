@@ -1,5 +1,8 @@
 import type * as SQLite from 'expo-sqlite';
 import { CANONICAL_OUTBOX_TABLE, LocalLedgerGuard } from './LocalLedgerGuard';
+import { resolveApiBaseUrl } from './ApiConfig';
+import { CryptoSignatureEngine } from './CryptoSignatureEngine';
+import { base45Decode, base45Encode, utf8Decode, utf8Encode } from '../utils/TelephonyBridge';
 
 export type CoordinatorEngineStatus =
   | 'IDLE'
@@ -294,14 +297,33 @@ export class StateCoordinator {
       },
       httpsAdapter: {
         post: async (params) => {
-          const base = this.resolveApiBaseUrl();
+          const base = resolveApiBaseUrl();
+          const driverId = await this.resolveDriverId(params.payload);
+          const action = {
+            ...params,
+            action_type: params.action_type.toUpperCase(),
+            payload: {
+              ...params.payload,
+              order_id: params.order_id,
+              driver_id: driverId,
+            },
+          };
+          const rawWire = JSON.stringify(action);
+          const signature = await CryptoSignatureEngine.generateSignature(
+            rawWire,
+            await this.resolveDeviceSecret(),
+          );
           const response = await fetch(`${base}/api/v1/sync/action`, {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
               'Idempotency-Key': params.idempotency_key,
             },
-            body: JSON.stringify(params),
+            body: JSON.stringify({
+              ...action,
+              __kona_signature_hex: signature,
+              __kona_raw_wire: rawWire,
+            }),
           });
 
           return response.ok;
@@ -310,10 +332,24 @@ export class StateCoordinator {
       smsAdapter: {
         send: async (wireString) => {
           const tx = await SMSTransportManager.create();
-          return tx.send(wireString);
+          const action = JSON.parse(utf8Decode(base45Decode(wireString))) as {
+            payload: Record<string, unknown>;
+          } & Record<string, unknown>;
+          action.payload = {
+            ...action.payload,
+            driver_id: await this.resolveDriverId(action.payload),
+          };
+          const signedWire = base45Encode(utf8Encode(JSON.stringify(action)));
+          return tx.send(signedWire, await this.resolveDeviceSecret());
         },
       },
     }) as SyncManagerLike;
+
+    const { TelemetrySyncManager } = await import('./TelemetrySyncManager');
+    TelemetrySyncManager.configure({
+      apiBaseUrl: resolveApiBaseUrl(),
+      getDeviceSecret: () => this.resolveDeviceSecret(),
+    });
 
     return this.defaultSyncManager;
   }
@@ -344,14 +380,6 @@ export class StateCoordinator {
     return 'none';
   }
 
-  private static resolveApiBaseUrl(): string {
-    const envBase =
-      typeof process !== 'undefined' && typeof process.env.KONA_API_BASE_URL === 'string'
-        ? process.env.KONA_API_BASE_URL.trim()
-        : '';
-    return envBase || 'http://localhost:3000';
-  }
-
   static async resolveDeviceSecret(): Promise<string> {
     // Preferred path: secure on-device key store.
     const secureStore = this.tryRequire<{ getItemAsync: (key: string) => Promise<string | null> }>(
@@ -376,6 +404,38 @@ export class StateCoordinator {
 
     throw new Error(
       '[StateCoordinator] Missing device secret. Configure secure storage key KONA_DEVICE_SECRET or provide StateCoordinator.configure({ getDeviceSecret }).',
+    );
+  }
+
+  private static async resolveDriverId(
+    payload: Record<string, unknown> = {},
+  ): Promise<string> {
+    const payloadDriverId =
+      typeof payload.driver_id === 'string' ? payload.driver_id.trim() : '';
+    if (payloadDriverId) {
+      return payloadDriverId;
+    }
+
+    const secureStore = this.tryRequire<{ getItemAsync: (key: string) => Promise<string | null> }>(
+      'expo-secure-store',
+    );
+    if (secureStore && typeof secureStore.getItemAsync === 'function') {
+      const stored = await secureStore.getItemAsync('KONA_DRIVER_ID');
+      if (typeof stored === 'string' && stored.trim()) {
+        return stored.trim();
+      }
+    }
+
+    const envDriverId =
+      typeof process !== 'undefined' && typeof process.env.KONA_DRIVER_ID === 'string'
+        ? process.env.KONA_DRIVER_ID.trim()
+        : '';
+    if (envDriverId) {
+      return envDriverId;
+    }
+
+    throw new Error(
+      '[StateCoordinator] Missing driver identity. Configure secure storage key KONA_DRIVER_ID, KONA_DRIVER_ID, or include payload.driver_id.',
     );
   }
 

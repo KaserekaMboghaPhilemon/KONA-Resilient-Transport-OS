@@ -43,8 +43,18 @@ jest.mock('../../repositories/TripRepository', () => ({
 jest.mock('../../repositories/DriverSecretRepository', () => ({
   DriverSecretRepository: {
     getSecretByDriverId: jest.fn().mockResolvedValue('TEST_DRIVER_SECRET'),
+    getAuthenticationByPhone: jest.fn().mockResolvedValue(null),
   },
 }));
+
+jest.mock('../../database/knex', () => {
+  const query = {
+    where: jest.fn().mockReturnThis(),
+    first: jest.fn().mockResolvedValue({ order_id: 'trip-telemetry' }),
+    insert: jest.fn().mockResolvedValue(1),
+  };
+  return { knex: jest.fn(() => query) };
+});
 
 import smsIntakeRouter from '../smsIntake';
 import { SMSReassemblyManager } from '../../services/SMSReassemblyManager';
@@ -529,6 +539,7 @@ describe('smsIntake — POST /api/v1/sms/gateway-webhook', () => {
         status: 'error',
         message: expect.stringContaining('From'),
       });
+
     });
 
     it('returns HTTP 400 when the message body field (Body / text) is absent', async () => {
@@ -603,6 +614,29 @@ describe('smsIntake — POST /api/v1/sms/gateway-webhook', () => {
       expect(res.body).toMatchObject({
         status: 'error',
         message: expect.stringMatching(/signature verification failed/i),
+      });
+    });
+
+    describe('telemetry batch wire', () => {
+      it('reassembles, authenticates, and stores an SMS telemetry batch', async () => {
+        mockDriverSecretRepository.getAuthenticationByPhone.mockResolvedValue({
+          driver_id: 'driver-xyz',
+          secret_key: 'TEST_DRIVER_SECRET',
+        });
+        const rawWire = encodePayload({
+          message_type: 'TELEMETRY_BATCH',
+          trip_id: 'trip-telemetry',
+          payload_b45: base45.encode(Buffer.from('trip-telemetry|1.2,2.3,,1700000000000')),
+          point_count: 1,
+        });
+        const frame = makeKonaFrame('TM01', 1, 1, rawWire, makeSignature(rawWire));
+
+        const response = await request(app)
+          .post('/api/v1/sms/gateway-webhook')
+          .send({ From: SENDER_A, Body: frame });
+
+        expect(response.status).toBe(200);
+        expect(response.body.message).toMatch(/telemetry batch.*stored/i);
       });
     });
   });

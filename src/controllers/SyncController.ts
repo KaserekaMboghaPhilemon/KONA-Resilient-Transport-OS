@@ -1,5 +1,6 @@
 import { knex } from '../database/knex';
 import { IdempotencyRepository } from '../repositories/IdempotencyRepository';
+import { OfflineLedgerRepository, type OfflineLedgerActionType } from '../repositories/OfflineLedgerRepository';
 import { TripRepository } from '../repositories/TripRepository';
 import { DriverSecretRepository } from '../repositories/DriverSecretRepository';
 import { CryptoSignatureEngine } from '../services/CryptoSignatureEngine';
@@ -30,7 +31,12 @@ export interface KonaSyncAction {
   /** UUID or transaction ID for idempotency defence. */
   idempotency_key: string;
   /** Domain action type that determines routing. */
-  action_type: 'CREATE_TRIP' | 'START_RIDE' | 'UPDATE_FARE' | 'END_RIDE';
+  action_type:
+    | 'CREATE_TRIP'
+    | 'START_RIDE'
+    | 'UPDATE_FARE'
+    | 'END_RIDE'
+    | OfflineLedgerActionType;
   /** Action-specific parameters; structure varies by action_type. */
   payload: Record<string, unknown>;
 }
@@ -38,6 +44,7 @@ export interface KonaSyncAction {
 interface KonaSecurityEnvelope {
   __kona_signature_hex?: unknown;
   __kona_raw_wire?: unknown;
+  __kona_sender?: unknown;
 }
 
 interface PreparedSyncAction {
@@ -204,7 +211,13 @@ export class SyncController {
       typedAction.action_type !== 'CREATE_TRIP' &&
       typedAction.action_type !== 'START_RIDE' &&
       typedAction.action_type !== 'UPDATE_FARE' &&
-      typedAction.action_type !== 'END_RIDE'
+      typedAction.action_type !== 'END_RIDE' &&
+      typedAction.action_type !== 'BOOKING_LOCK' &&
+      typedAction.action_type !== 'BOOKING_REVERSAL' &&
+      typedAction.action_type !== 'TRIP_SETTLEMENT' &&
+      typedAction.action_type !== 'ORDER_STATUS_UPDATE' &&
+      typedAction.action_type !== 'DRIVER_LOCATION_UPDATE' &&
+      typedAction.action_type !== 'DISPATCH_OFFER_RESPONSE'
     ) {
       throw new TypeError(
         '[SyncController] Missing or malformed required field: "action_type".',
@@ -219,9 +232,19 @@ export class SyncController {
     }
 
     const normalizedAction = typedAction as KonaSyncAction;
-    await this.verifyIncomingSignature(normalizedAction.payload, envelope);
+    const authenticatedDriverId = await this.verifyIncomingSignature(
+      normalizedAction.payload,
+      envelope,
+    );
 
-    return { action: normalizedAction };
+    return {
+      action: authenticatedDriverId
+        ? {
+            ...normalizedAction,
+            payload: { ...normalizedAction.payload, driver_id: authenticatedDriverId },
+          }
+        : normalizedAction,
+    };
   }
 
   private static async executePreparedAction(
@@ -273,6 +296,30 @@ export class SyncController {
         break;
       }
 
+      case 'BOOKING_LOCK':
+      case 'BOOKING_REVERSAL':
+      case 'TRIP_SETTLEMENT':
+      case 'ORDER_STATUS_UPDATE':
+      case 'DRIVER_LOCATION_UPDATE':
+      case 'DISPATCH_OFFER_RESPONSE': {
+        const tripId = String(payload.order_id ?? '');
+        const driverId = typeof payload.driver_id === 'string' ? payload.driver_id : '';
+        if (!tripId) {
+          throw new TypeError(`[SyncController] ${action_type} requires payload.order_id.`);
+        }
+        if (!driverId) {
+          throw new TypeError(`[SyncController] ${action_type} requires an authenticated driver.`);
+        }
+        await OfflineLedgerRepository.apply(
+          action_type,
+          tripId,
+          driverId,
+          payload,
+          trx,
+        );
+        break;
+      }
+
       default:
         const exhaustiveCheck: never = action_type;
         throw new Error(
@@ -302,15 +349,19 @@ export class SyncController {
   private static async verifyIncomingSignature(
     payload: Record<string, unknown>,
     envelope: KonaSecurityEnvelope,
-  ): Promise<void> {
+  ): Promise<string | null> {
     const incomingSignature =
       typeof envelope.__kona_signature_hex === 'string'
         ? envelope.__kona_signature_hex.trim().toUpperCase()
         : '';
 
-    // Legacy payloads with no signature metadata remain accepted.
     if (!incomingSignature) {
-      return;
+      if (typeof envelope.__kona_sender === 'string') {
+        throw new SignatureAuthenticationError(
+          '[SyncController] SMS action is missing its required signature.',
+        );
+      }
+      return null;
     }
 
     if (!/^[A-F0-9]{8}$/.test(incomingSignature)) {
@@ -327,15 +378,28 @@ export class SyncController {
       );
     }
 
-    const driverId =
+    const payloadDriverId =
       typeof payload.driver_id === 'string' ? payload.driver_id.trim() : '';
+    const sender =
+      typeof envelope.__kona_sender === 'string' ? envelope.__kona_sender.trim() : '';
+    const senderAuthentication = sender
+      ? await DriverSecretRepository.getAuthenticationByPhone(sender)
+      : null;
+    const driverId = payloadDriverId || senderAuthentication?.driver_id || '';
     if (!driverId) {
       throw new SignatureAuthenticationError(
-        '[SyncController] Missing payload.driver_id for signature verification.',
+        '[SyncController] Missing driver identity for signature verification.',
+      );
+    }
+    if (senderAuthentication && senderAuthentication.driver_id !== driverId) {
+      throw new SignatureAuthenticationError(
+        '[SyncController] SMS sender does not match payload.driver_id.',
       );
     }
 
-    const secret = await DriverSecretRepository.getSecretByDriverId(driverId);
+    const secret = senderAuthentication?.driver_id === driverId
+      ? senderAuthentication.secret_key
+      : await DriverSecretRepository.getSecretByDriverId(driverId);
     if (!secret) {
       throw new SignatureAuthenticationError(
         `[SyncController] No authentication secret registered for driver ${driverId}.`,
@@ -352,6 +416,8 @@ export class SyncController {
         `[SyncController] Signature verification failed for driver ${driverId}.`,
       );
     }
+
+    return driverId;
   }
 
   private static getTripId(

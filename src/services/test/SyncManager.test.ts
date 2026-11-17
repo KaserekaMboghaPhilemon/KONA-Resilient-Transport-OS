@@ -192,6 +192,7 @@ import {
   type SmsSenderAdapter,
   type EntryProcessingResult,
 } from '../SyncManager';
+import { base45Decode, utf8Decode } from '../../utils/TelephonyBridge';
 
 // ---------------------------------------------------------------------------
 // Mock store helpers
@@ -260,15 +261,13 @@ function makeSmsAdapter(
   alwaysFailFor: OfflineActionType[] = [],
   wireLog: string[] = [],
 ): SmsSenderAdapter {
-  const prefixToAction: Record<string, OfflineActionType> = {
-    BL: 'booking_lock', BR: 'booking_reversal', TS: 'trip_settlement',
-    OS: 'order_status_update', DL: 'driver_location_update', DO: 'dispatch_offer_response',
-  };
   return {
     async send(wireString): Promise<boolean> {
-      wireLog.push(wireString.slice(0, 6));
-      const prefix = wireString.slice(1, 3);
-      const actionType = prefixToAction[prefix];
+      const decoded = JSON.parse(utf8Decode(base45Decode(wireString))) as {
+        action_type: string;
+      };
+      wireLog.push(decoded.action_type);
+      const actionType = decoded.action_type.toLowerCase() as OfflineActionType;
       if (actionType && (alwaysFailFor as string[]).includes(actionType)) {
         throw new Error(`SMS gateway timeout simulated for ${actionType}`);
       }
@@ -462,8 +461,8 @@ describe('Phase 3 Ã¢â‚¬â€ connectivity: sms_only', () => {
     expect(dof?.outcome).toBe('failed_permanently');
   });
 
-  it('records a KOS wire string in the SMS log for order_status_update', () => {
-    expect(smsWireLog.some((w) => w.startsWith('KOS'))).toBe(true);
+  it('records the canonical uppercase action type in the SMS payload', () => {
+    expect(smsWireLog).toContain('ORDER_STATUS_UPDATE');
   });
 
   it('marks the failed entry as sync_status = failed in the store', () => {

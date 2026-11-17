@@ -26,6 +26,7 @@ jest.mock('../../database/knex', () => ({
 }));
 jest.mock('../../repositories/IdempotencyRepository');
 jest.mock('../../repositories/TripRepository');
+jest.mock('../../repositories/OfflineLedgerRepository');
 jest.mock('../../repositories/DriverSecretRepository');
 jest.mock('../../services/BackgroundLocationWorker', () => ({
   BackgroundLocationWorker: {
@@ -37,6 +38,7 @@ jest.mock('../../services/BackgroundLocationWorker', () => ({
 import { SyncController } from '../SyncController';
 import { IdempotencyRepository } from '../../repositories/IdempotencyRepository';
 import { TripRepository } from '../../repositories/TripRepository';
+import { OfflineLedgerRepository } from '../../repositories/OfflineLedgerRepository';
 import { DriverSecretRepository } from '../../repositories/DriverSecretRepository';
 import { BackgroundLocationWorker } from '../../services/BackgroundLocationWorker';
 import { CryptoSignatureEngine } from '../../services/CryptoSignatureEngine';
@@ -44,6 +46,7 @@ import { ServerLedgerReconciler } from '../../services/ServerLedgerReconciler';
 
 const mockIdempotencyRepository = IdempotencyRepository as jest.Mocked<typeof IdempotencyRepository>;
 const mockTripRepository = TripRepository as jest.Mocked<typeof TripRepository>;
+const mockOfflineLedgerRepository = OfflineLedgerRepository as jest.Mocked<typeof OfflineLedgerRepository>;
 const mockDriverSecretRepository = DriverSecretRepository as jest.Mocked<typeof DriverSecretRepository>;
 const mockBackgroundLocationWorker = BackgroundLocationWorker as jest.Mocked<typeof BackgroundLocationWorker>;
 
@@ -54,6 +57,10 @@ describe('SyncController – Sprint 8.5 Lifecycle Binding Tests', () => {
     mockIdempotencyRepository.checkAndRegisterKey.mockResolvedValue(false);
     mockIdempotencyRepository.releaseKey.mockResolvedValue(undefined);
     mockDriverSecretRepository.getSecretByDriverId.mockResolvedValue('TEST_DRIVER_SECRET');
+    mockDriverSecretRepository.getAuthenticationByPhone.mockResolvedValue({
+      driver_id: 'driver-xyz',
+      secret_key: 'TEST_DRIVER_SECRET',
+    });
   });
 
   describe('Sprint 11.5 signature authentication gate', () => {
@@ -286,6 +293,36 @@ describe('SyncController – Sprint 8.5 Lifecycle Binding Tests', () => {
       // Should not attempt any repository operations
       expect(mockTripRepository.updateTripStatus).not.toHaveBeenCalled();
       expect(mockBackgroundLocationWorker.startTracking).not.toHaveBeenCalled();
+    });
+
+    describe('SMS authentication and offline-ledger dispatch', () => {
+      it('authenticates the gateway sender, restores the driver identity, and dispatches a ledger action', async () => {
+        const rawWire = 'BASE45_CANONICAL_JSON';
+        const signature = await CryptoSignatureEngine.generateSignature(
+          rawWire,
+          'TEST_DRIVER_SECRET',
+        );
+        mockOfflineLedgerRepository.apply.mockResolvedValue(undefined);
+
+        await SyncController.executeAction({
+          idempotency_key: 'sms-idem-1',
+          action_type: 'DRIVER_LOCATION_UPDATE',
+          payload: { order_id: 'trip-1', h3_cell: '8928308280fffff' },
+          __kona_signature_hex: signature,
+          __kona_raw_wire: rawWire,
+          __kona_sender: '+254700000001',
+        });
+
+        expect(mockDriverSecretRepository.getAuthenticationByPhone)
+          .toHaveBeenCalledWith('+254700000001');
+        expect(mockOfflineLedgerRepository.apply).toHaveBeenCalledWith(
+          'DRIVER_LOCATION_UPDATE',
+          'trip-1',
+          'driver-xyz',
+          expect.objectContaining({ h3_cell: '8928308280fffff' }),
+          expect.anything(),
+        );
+      });
     });
 
     describe('verified batch transaction execution', () => {

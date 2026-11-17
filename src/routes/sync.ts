@@ -5,6 +5,7 @@ import {
   SignatureAuthenticationError,
   SyncController,
 } from '../controllers/SyncController';
+import type { KonaSyncAction } from '../controllers/SyncController';
 
 interface SyncIngestResponse {
   status: 'ok' | 'error';
@@ -15,6 +16,50 @@ interface SyncIngestResponse {
 }
 
 const router = Router();
+
+router.post(
+  '/action',
+  async (
+    req: Request<unknown, SyncIngestResponse, Partial<KonaSyncAction> & { order_id?: string }>,
+    res: Response<SyncIngestResponse>,
+  ): Promise<void> => {
+    try {
+      const body = req.body;
+      if (!body || typeof body !== 'object') {
+        res.status(400).json({ status: 'error', message: 'A JSON action body is required.' });
+        return;
+      }
+
+      const payload =
+        body.payload && typeof body.payload === 'object' && !Array.isArray(body.payload)
+          ? { ...body.payload }
+          : body.payload;
+      if (payload && typeof payload === 'object' && !Array.isArray(payload) && body.order_id) {
+        payload.order_id = payload.order_id ?? body.order_id;
+      }
+
+      await SyncController.executeAction({
+        ...body,
+        action_type:
+          typeof body.action_type === 'string'
+            ? body.action_type.toUpperCase()
+            : body.action_type,
+        payload,
+      });
+
+      res.status(200).json({ status: 'ok', message: 'Action processed successfully.' });
+    } catch (error) {
+      if (error instanceof SignatureAuthenticationError) {
+        res.status(401).json({ status: 'error', message: error.message });
+        return;
+      }
+
+      const message =
+        error instanceof Error ? error.message : 'Unexpected sync action error.';
+      res.status(400).json({ status: 'error', message });
+    }
+  },
+);
 
 router.post(
   '/offline-batch',
