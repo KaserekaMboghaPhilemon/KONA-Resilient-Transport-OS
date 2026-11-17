@@ -14,6 +14,10 @@ app.use("/api/v1/sms", smsIntakeRouter);
 app.use("/api/v1/sync", syncRouter);
 app.use("/api/v1/telemetry", telemetryRouter);
 
+app.get("/", (_req, res) => {
+  res.json({ status: "success", message: "KONA Transport OS API is running" });
+});
+
 const host = process.env.HOST ?? "0.0.0.0";
 
 app.listen(port, host, () => {
