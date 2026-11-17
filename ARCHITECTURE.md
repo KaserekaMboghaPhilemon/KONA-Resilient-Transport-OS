@@ -1116,6 +1116,22 @@ const syncSpy = jest
 }
 ```
 
+### 10.4 Sprint 20.6 — Containers and CI
+
+- `docker compose up --build` starts the API, PostgreSQL 16 with `pgvector`,
+  and Redis 7. PostgreSQL and Redis data are retained in named volumes.
+- The Compose PostgreSQL password defaults to a local-development value;
+  override `POSTGRES_PASSWORD` for shared environments. PostgreSQL is bound
+  to loopback, while Redis is only reachable on the Compose network.
+- The API receives `DATABASE_URL` and `REDIS_URL`. BullMQ is available as a
+  runtime dependency; application-specific queue producers and workers must
+  be added alongside the jobs that use them.
+- `.github/workflows/ci.yml` type-checks and runs the test suite for pushes
+  and pull requests targeting `main`. Jest is invoked with `--forceExit`
+  because the current suite leaves an open handle after reporting results.
+- The Docker build uses the CommonJS server configuration so Node can execute
+  the compiled Express entry point without a module-loader flag.
+
 ---
 
 ## 11. Naming Conventions
