@@ -206,6 +206,7 @@ export class OfflineLedgerRepository {
         }
       }
     }
+  }
 
     private static async postBookingLock(
       trx: Knex.Transaction,
@@ -425,5 +426,4 @@ export class OfflineLedgerRepository {
         throw new Error(`[OfflineLedgerRepository] Could not ${operation}; escrow state changed concurrently.`);
       }
     }
-  }
 }
