@@ -109,6 +109,7 @@ describe('TelemetrySyncManager – Task 9.4 Periodic Daemon & Backoff', () => {
   afterEach(() => {
     TelemetrySyncManager.stopPeriodicSync();
     jest.useRealTimers();
+    jest.restoreAllMocks();
   });
 
   // Belt-and-suspenders: ensure the static daemon is fully stopped and real
