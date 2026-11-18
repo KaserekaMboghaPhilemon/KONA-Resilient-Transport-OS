@@ -407,7 +407,7 @@ describe('TelemetrySyncManager – Task 9.4 Periodic Daemon & Backoff', () => {
         originalFetch = global.fetch;
         TelemetrySyncManager.configure({
           apiBaseUrl: 'https://kona.example',
-          connectivityProbe: { getState: async () => 'internet' },
+          connectivityProbe: { getState: async () => 'internet' as const },
           getDeviceSecret: async () => 'test-device-secret',
           getDriverId: async () => 'driver-001',
         });
@@ -451,7 +451,7 @@ describe('TelemetrySyncManager – Task 9.4 Periodic Daemon & Backoff', () => {
 
       it('retains pings when the SMS carrier accepts but the server has not acknowledged', async () => {
         TelemetrySyncManager.configure({
-          connectivityProbe: { getState: async () => 'sms_only' },
+          connectivityProbe: { getState: async () => 'sms_only' as const },
         });
 
         await expect(TelemetrySyncManager.processTelemetrySync('trip-001')).rejects.toThrow(
