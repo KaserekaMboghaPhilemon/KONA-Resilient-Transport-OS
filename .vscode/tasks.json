@@ -1,0 +1,46 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "type": "shell",
+      "label": "KONA: Run Full Test Suite",
+      "command": "npm test -- --runInBand --forceExit",
+      "group": {
+        "kind": "test",
+        "isDefault": true
+      },
+      "problemMatcher": [],
+      "options": {
+        "shell": {
+          "executable": "C:\\Program Files\\Git\\bin\\bash.exe",
+          "args": ["--login", "-c"]
+        }
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": false,
+        "focus": false
+      }
+    },
+    {
+      "type": "shell",
+      "label": "KONA: Start Docker Stack & Verifier",
+      "command": "docker compose up --build -d && docker compose exec backend npx ts-node src/scripts/validate-system.ts",
+      "group": "build",
+      "problemMatcher": [],
+      "options": {
+        "shell": {
+          "executable": "C:\\Program Files\\Git\\bin\\bash.exe",
+          "args": ["--login", "-c"]
+        }
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": false,
+        "focus": false
+      }
+    }
+  ]
+}

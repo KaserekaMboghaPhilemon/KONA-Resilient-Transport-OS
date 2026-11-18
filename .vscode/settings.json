@@ -1,0 +1,11 @@
+{
+  "jest.jestCommandLine": "npm test --",
+  "jest.runMode": "on-demand",
+  "terminal.integrated.profiles.windows": {
+    "Git Bash": {
+      "path": "C:\\Program Files\\Git\\bin\\bash.exe",
+      "args": ["--login", "-i"]
+    }
+  },
+  "terminal.integrated.defaultProfile.windows": "Git Bash"
+}
