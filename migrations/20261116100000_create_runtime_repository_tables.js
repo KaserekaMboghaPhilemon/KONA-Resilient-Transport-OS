@@ -30,16 +30,17 @@ exports.up = async function (knex) {
     table.timestamp('processed_at', { useTz: true }).notNullable().defaultTo(knex.fn.now());
   });
 
-  await knex.schema.createTable('driver_auth_secrets', (table) => {
-    table.uuid('driver_id').primary().references('driver_id').inTable('drivers').onDelete('CASCADE');
-    table.text('secret_key').notNullable();
-    table.timestamp('created_at', { useTz: true }).notNullable().defaultTo(knex.fn.now());
-    table.check('length(trim(secret_key)) > 0');
-  });
+  if (!(await knex.schema.hasTable('driver_auth_secrets'))) {
+    await knex.schema.createTable('driver_auth_secrets', (table) => {
+      table.uuid('driver_id').primary().references('driver_id').inTable('drivers').onDelete('CASCADE');
+      table.text('secret_key').notNullable();
+      table.timestamp('created_at', { useTz: true }).notNullable().defaultTo(knex.fn.now());
+      table.check('length(trim(secret_key)) > 0');
+    });
+  }
 };
 
 exports.down = async function (knex) {
-  await knex.schema.dropTableIfExists('driver_auth_secrets');
   await knex.schema.dropTableIfExists('processed_idempotency_keys');
   await knex.schema.dropTableIfExists('driver_ledgers');
   await knex.schema.dropTableIfExists('trips');

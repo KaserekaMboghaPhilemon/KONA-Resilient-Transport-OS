@@ -19,20 +19,15 @@ export class DriverSecretRepository {
       return null;
     }
 
-    try {
-      const row = await knex('driver_auth_secrets')
-        .where({ driver_id: normalized })
-        .first<DriverSecretRow>();
+    const row = await knex('driver_auth_secrets')
+      .where({ driver_id: normalized })
+      .first<DriverSecretRow>();
 
-      if (!row || typeof row.secret_key !== 'string' || row.secret_key.trim().length === 0) {
-        return null;
-      }
-
-      return row.secret_key;
-    } catch (error) {
-      console.error('[DriverSecretRepository] Failed to fetch driver secret:', error);
+    if (!row || typeof row.secret_key !== 'string' || row.secret_key.trim().length === 0) {
       return null;
     }
+
+    return row.secret_key;
   }
 
   public static async getAuthenticationByPhone(

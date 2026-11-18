@@ -224,8 +224,10 @@ async function validateRedis(): Promise<CheckDetails> {
 }
 
 async function validateBackend(): Promise<CheckDetails> {
-  if (!existsSync('/.dockerenv')) {
-    throw new Error('System validation must run inside the backend Docker container.');
+  if (!existsSync('/.dockerenv') && process.env.KONA_ALLOW_HOST_VALIDATION !== 'true') {
+    throw new Error(
+      'System validation must run in a container or with KONA_ALLOW_HOST_VALIDATION=true.',
+    );
   }
 
   const port = Number(process.env.PORT ?? 3000);
@@ -259,7 +261,8 @@ async function validateBackend(): Promise<CheckDetails> {
   }
 
   return {
-    containerMarkerPresent: true,
+    containerMarkerPresent: existsSync('/.dockerenv'),
+    hostValidationAllowed: process.env.KONA_ALLOW_HOST_VALIDATION === 'true',
     nodeEnvironment: process.env.NODE_ENV ?? 'unset',
     port,
     httpStatus: response.status,

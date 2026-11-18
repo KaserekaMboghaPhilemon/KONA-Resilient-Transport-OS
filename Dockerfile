@@ -20,6 +20,8 @@ COPY --from=production-dependencies --chown=node:node /app/node_modules ./node_m
 COPY --from=build --chown=node:node /app/dist ./dist
 COPY --from=build --chown=node:node /app/src/scripts/validate-system.ts ./src/scripts/validate-system.ts
 COPY --from=build --chown=node:node /app/tsconfig.json /app/tsconfig.dev.json ./
+COPY --chown=node:node migrations ./migrations
+COPY --chown=node:node knexfile.js SPRINT1_SCHEMA.sql ./
 COPY --chown=node:node package.json ./
 USER node
 EXPOSE 3000

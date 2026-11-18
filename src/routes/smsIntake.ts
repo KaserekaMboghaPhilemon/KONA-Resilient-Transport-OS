@@ -36,7 +36,8 @@ import { SMSReassemblyManager } from '../services/SMSReassemblyManager';
 import { SignatureAuthenticationError, SyncController } from '../controllers/SyncController';
 import { DriverSecretRepository } from '../repositories/DriverSecretRepository';
 import { CryptoSignatureEngine } from '../services/CryptoSignatureEngine';
-import { storeTelemetryBatch, type TelemetryBatchBody } from './telemetry';
+import { storeTelemetryBatch } from './telemetry';
+import type { TelemetryBatchBody } from '../utils/TelemetryAuth';
 
 // ---------------------------------------------------------------------------
 // Type definitions

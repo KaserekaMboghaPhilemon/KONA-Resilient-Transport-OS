@@ -8,6 +8,7 @@
     "dev": "ts-node-dev --respawn --transpile-only --project tsconfig.dev.json src/index.ts",
     "build": "tsc --project tsconfig.dev.json",
     "start": "node dist/index.js",
+    "migrate": "knex migrate:latest",
     "test": "jest"
   },
   "dependencies": {
@@ -51,10 +52,21 @@
         "displayName": "unit",
         "preset": "ts-jest",
         "testEnvironment": "node",
+        "transform": {
+          "^.+\\.tsx?$": [
+            "ts-jest",
+            {
+              "tsconfig": "<rootDir>/tsconfig.test.json"
+            }
+          ]
+        },
         "testMatch": [
           "<rootDir>/src/db/**/*.test.ts",
           "<rootDir>/src/services/**/*.test.ts",
-          "<rootDir>/src/routes/**/*.test.ts"
+          "<rootDir>/src/routes/**/*.test.ts",
+          "<rootDir>/src/controllers/**/*.test.ts",
+          "<rootDir>/src/repositories/**/*.test.ts",
+          "<rootDir>/tests/integration/**/*.test.ts"
         ]
       },
       {

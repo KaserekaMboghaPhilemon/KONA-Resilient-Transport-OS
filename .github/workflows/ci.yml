@@ -14,6 +14,36 @@ jobs:
     name: Type-check and test
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    env:
+      DATABASE_URL: postgres://kona:kona-ci-password@localhost:5432/kona
+      REDIS_URL: redis://localhost:6379
+      KONA_RUN_INTEGRATION_TESTS: '1'
+      KONA_ALLOW_HOST_VALIDATION: 'true'
+      KONA_API_HEALTH_URL: http://127.0.0.1:3000/
+      TS_NODE_PROJECT: tsconfig.dev.json
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: kona
+          POSTGRES_USER: kona
+          POSTGRES_PASSWORD: kona-ci-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U kona -d kona"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
@@ -27,8 +57,35 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Initialize PostgreSQL extensions and core schema
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c 'CREATE EXTENSION IF NOT EXISTS vector;'
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f SPRINT1_SCHEMA.sql
+
+      - name: Run database migrations
+        run: npm run migrate
+
       - name: Type-check
         run: npx tsc --noEmit
 
+      - name: Build backend
+        run: npm run build
+
       - name: Run tests
         run: npm test -- --runInBand --forceExit
+
+      - name: Start backend for system verification
+        run: |
+          npm start > backend.log 2>&1 &
+          echo $! > backend.pid
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent "$KONA_API_HEALTH_URL" > /dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          cat backend.log
+          exit 1
+
+      - name: Verify PostgreSQL, pgvector, Redis, and backend
+        run: npx ts-node src/scripts/validate-system.ts

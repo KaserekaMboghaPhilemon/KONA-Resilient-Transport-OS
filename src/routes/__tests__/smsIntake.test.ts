@@ -56,10 +56,15 @@ jest.mock('../../database/knex', () => {
   return { knex: jest.fn(() => query) };
 });
 
+jest.mock('../telemetry', () => ({
+  storeTelemetryBatch: jest.fn().mockResolvedValue(1),
+}));
+
 import smsIntakeRouter from '../smsIntake';
 import { SMSReassemblyManager } from '../../services/SMSReassemblyManager';
 import { SyncController } from '../../controllers/SyncController';
 import { DriverSecretRepository } from '../../repositories/DriverSecretRepository';
+import { storeTelemetryBatch } from '../telemetry';
 
 const mockDriverSecretRepository = DriverSecretRepository as jest.Mocked<typeof DriverSecretRepository>;
 
@@ -625,9 +630,12 @@ describe('smsIntake — POST /api/v1/sms/gateway-webhook', () => {
         });
         const rawWire = encodePayload({
           message_type: 'TELEMETRY_BATCH',
-          trip_id: 'trip-telemetry',
-          payload_b45: base45.encode(Buffer.from('trip-telemetry|1.2,2.3,,1700000000000')),
+          trip_id: '123e4567-e89b-42d3-a456-426614174001',
+          payload_b45: base45.encode(
+            Buffer.from(`123e4567-e89b-42d3-a456-426614174001|1.2,2.3,,${Date.now()}`),
+          ),
           point_count: 1,
+          idempotency_key: 'a'.repeat(64),
         });
         const frame = makeKonaFrame('TM01', 1, 1, rawWire, makeSignature(rawWire));
 
@@ -637,6 +645,10 @@ describe('smsIntake — POST /api/v1/sms/gateway-webhook', () => {
 
         expect(response.status).toBe(200);
         expect(response.body.message).toMatch(/telemetry batch.*stored/i);
+        expect(storeTelemetryBatch).toHaveBeenCalledWith(
+          expect.objectContaining({ idempotency_key: 'a'.repeat(64) }),
+          'driver-xyz',
+        );
       });
     });
   });

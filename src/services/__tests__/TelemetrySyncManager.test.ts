@@ -33,6 +33,26 @@ jest.mock('base45', () => ({
   encode: jest.fn((_buf: Buffer) => 'MOCK_B45_PAYLOAD'),
 }));
 
+const mockInitializeRepository = jest.fn().mockResolvedValue(undefined);
+const mockGetUnsyncedPings = jest.fn();
+const mockClearSyncedPings = jest.fn().mockResolvedValue(undefined);
+const mockSendPayloadAsChunks = jest.fn();
+const mockTelemetryRepository = {
+  initialize: mockInitializeRepository,
+  getUnsyncedPings: mockGetUnsyncedPings,
+  clearSyncedPings: mockClearSyncedPings,
+};
+
+jest.mock('../SQLiteTelemetryRepository', () => ({
+  SQLiteTelemetryRepository: jest.fn(() => mockTelemetryRepository),
+}));
+
+jest.mock('../SMSTransportManager', () => ({
+  SMSTransportManager: {
+    create: jest.fn(async () => ({ sendPayloadAsChunks: mockSendPayloadAsChunks })),
+  },
+}));
+
 // ---------------------------------------------------------------------------
 // Imports (after mocks)
 // ---------------------------------------------------------------------------
@@ -72,6 +92,18 @@ describe('TelemetrySyncManager – Task 9.4 Periodic Daemon & Backoff', () => {
     TelemetrySyncManager.stopPeriodicSync();
     jest.useRealTimers();
     jest.clearAllMocks();
+    mockGetUnsyncedPings.mockResolvedValue([
+      {
+        id: 21,
+        tripId: 'trip-001',
+        latitude: 1.2,
+        longitude: 2.3,
+        speed: 4.5,
+        heading: null,
+        timestamp: Date.now(),
+      },
+    ]);
+    mockSendPayloadAsChunks.mockResolvedValue(true);
   });
 
   afterEach(() => {
@@ -366,6 +398,68 @@ describe('TelemetrySyncManager – Task 9.4 Periodic Daemon & Backoff', () => {
       await Promise.resolve();
 
       expect(spy).toHaveBeenCalledTimes(1); // still just 1
+    });
+
+    describe('Acknowledged telemetry delivery', () => {
+      let originalFetch: typeof global.fetch;
+
+      beforeEach(() => {
+        originalFetch = global.fetch;
+        TelemetrySyncManager.configure({
+          apiBaseUrl: 'https://kona.example',
+          connectivityProbe: { getState: async () => 'internet' },
+          getDeviceSecret: async () => 'test-device-secret',
+          getDriverId: async () => 'driver-001',
+        });
+      });
+
+      afterEach(() => {
+        global.fetch = originalFetch;
+      });
+
+      it('clears local pings only after a valid server acknowledgment and accepted count', async () => {
+        global.fetch = jest.fn().mockResolvedValue({
+          status: 200,
+          json: async () => ({ status: 'ok', acceptedPoints: 1 }),
+        }) as unknown as typeof fetch;
+
+        await expect(TelemetrySyncManager.processTelemetrySync('trip-001')).resolves.toBeUndefined();
+
+        expect(mockClearSyncedPings).toHaveBeenCalledWith([21]);
+        expect(global.fetch).toHaveBeenCalledWith(
+          'https://kona.example/api/v1/telemetry/batch',
+          expect.objectContaining({
+            headers: expect.objectContaining({
+              'X-Kona-Driver-Id': 'driver-001',
+              'X-Kona-Signature': expect.stringMatching(/^[a-f\d]{64}$/i),
+            }),
+          }),
+        );
+      });
+
+      it('preserves local pings and propagates invalid acknowledgments for backoff', async () => {
+        global.fetch = jest.fn().mockResolvedValue({
+          status: 200,
+          json: async () => ({ status: 'ok', acceptedPoints: 0 }),
+        }) as unknown as typeof fetch;
+
+        await expect(TelemetrySyncManager.processTelemetrySync('trip-001')).rejects.toThrow(
+          'was not acknowledged',
+        );
+        expect(mockClearSyncedPings).not.toHaveBeenCalled();
+      });
+
+      it('retains pings when the SMS carrier accepts but the server has not acknowledged', async () => {
+        TelemetrySyncManager.configure({
+          connectivityProbe: { getState: async () => 'sms_only' },
+        });
+
+        await expect(TelemetrySyncManager.processTelemetrySync('trip-001')).rejects.toThrow(
+          'was not acknowledged',
+        );
+        expect(mockSendPayloadAsChunks).toHaveBeenCalled();
+        expect(mockClearSyncedPings).not.toHaveBeenCalled();
+      });
     });
   });
 });

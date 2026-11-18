@@ -349,6 +349,7 @@ export class StateCoordinator {
     TelemetrySyncManager.configure({
       apiBaseUrl: resolveApiBaseUrl(),
       getDeviceSecret: () => this.resolveDeviceSecret(),
+      getDriverId: () => this.resolveDriverId(),
     });
 
     return this.defaultSyncManager;

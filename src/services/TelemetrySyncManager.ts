@@ -5,6 +5,8 @@ import { SQLiteTelemetryRepository, type TelemetryPing } from './SQLiteTelemetry
 import { SMSTransportManager } from './SMSTransportManager';
 import type { ConnectivityProbe, ConnectivityState } from './SyncManager';
 import { resolveApiBaseUrl } from './ApiConfig';
+import { CryptoSignatureEngine } from './CryptoSignatureEngine';
+import { telemetrySignaturePayload } from '../utils/TelemetryAuth';
 
 const TELEMETRY_BATCH_LIMIT = 10;
 
@@ -20,12 +22,14 @@ interface TelemetryBatchPayload {
   trip_id: string;
   payload_b45: string;
   point_count: number;
+  idempotency_key: string;
 }
 
 interface TelemetrySyncDependencies {
   connectivityProbe: ConnectivityProbe;
   apiBaseUrl?: string;
   getDeviceSecret: () => Promise<string>;
+  getDriverId: () => Promise<string>;
 }
 
 /**
@@ -58,6 +62,9 @@ export class TelemetrySyncManager {
     },
     getDeviceSecret: async () => {
       throw new Error('[TelemetrySyncManager] Device secret provider is not configured.');
+    },
+    getDriverId: async () => {
+      throw new Error('[TelemetrySyncManager] Driver identity provider is not configured.');
     },
   };
 
@@ -179,8 +186,8 @@ export class TelemetrySyncManager {
   }
 
   /**
-   * Manually triggers an immediate telemetry sync, bypassing the backoff delay.
-   * Resets the consecutive failure counter and reschedules at the baseline interval.
+   * Manually triggers an immediate telemetry sync, bypassing the current delay.
+   * Success resets backoff; failure increments it and schedules a delayed retry.
    *
    * Safe to call multiple times; internally guards against concurrent execution.
    */
@@ -190,27 +197,21 @@ export class TelemetrySyncManager {
       throw new TypeError('[TelemetrySyncManager] forceTelemetrySync requires a non-empty tripId.');
     }
 
+    if (this.periodicTimerHandle !== null) {
+      clearTimeout(this.periodicTimerHandle);
+      this.periodicTimerHandle = null;
+    }
+
+    this.periodicTripId = normalizedTripId;
     try {
       console.log(
         `[TelemetrySyncManager] Manual flush triggered for trip ${normalizedTripId}. ` +
-          `Clearing backoff state and syncing immediately.`,
+          `Attempting an immediate sync.`,
       );
 
-      // Clear any pending timer so we don't double-execute.
-      if (this.periodicTimerHandle !== null) {
-        clearTimeout(this.periodicTimerHandle);
-        this.periodicTimerHandle = null;
-      }
-
-      // Run the sync directly (not inside runOneCycle so we bypass the try/catch
-      // and exception handling that would increment the failure counter).
       await this.processTelemetrySync(normalizedTripId);
 
-      // Always reset the failure counter after a manual flush, regardless of outcome.
       this.consecutiveFailures = 0;
-      this.periodicTripId = normalizedTripId;
-
-      // Reschedule at the baseline interval.
       this.scheduleNextCycle(TELEMETRY_BASE_INTERVAL_MS);
 
       console.log(
@@ -222,7 +223,8 @@ export class TelemetrySyncManager {
         `[TelemetrySyncManager] Manual flush failed for trip ${normalizedTripId}:`,
         error,
       );
-      // Don't rethrow — let the caller decide how to handle the error.
+      this.consecutiveFailures += 1;
+      this.scheduleNextCycle(this.computeBackoffDelay(this.consecutiveFailures));
     }
   }
 
@@ -269,52 +271,50 @@ export class TelemetrySyncManager {
       throw new TypeError('[TelemetrySyncManager] processTelemetrySync requires a non-empty tripId.');
     }
 
-    try {
-      const repository = await this.getTelemetryRepository();
-      const unsynced = await repository.getUnsyncedPings(normalizedTripId);
-      const batch = unsynced.slice(0, TELEMETRY_BATCH_LIMIT);
+    const repository = await this.getTelemetryRepository();
+    const unsynced = await repository.getUnsyncedPings(normalizedTripId);
+    const batch = unsynced.slice(0, TELEMETRY_BATCH_LIMIT);
 
-      if (batch.length === 0) {
-        console.log(
-          `[TelemetrySyncManager] No unsynced telemetry rows for trip ${normalizedTripId}.`,
-        );
-        return;
-      }
-
-      const serialized = this.serializeTelemetrySlice(normalizedTripId, batch);
-      const encodedPayload = this.base45Encode(serialized);
-
-      const networkState = await this.resolveConnectivityState();
-      const dispatched = await this.dispatchBatch(
-        normalizedTripId,
-        encodedPayload,
-        batch.length,
-        networkState,
-      );
-
-      if (!dispatched) {
-        console.warn(
-          `[TelemetrySyncManager] Batch dispatch not acknowledged for trip ${normalizedTripId}.`,
-        );
-        return;
-      }
-
-      const idsToClear = batch
-        .map((ping) => ping.id)
-        .filter((id): id is number => typeof id === 'number');
-
-      await repository.clearSyncedPings(idsToClear);
-
+    if (batch.length === 0) {
       console.log(
-        `[TelemetrySyncManager] Cleared ${idsToClear.length} synced telemetry row(s) ` +
-          `for trip ${normalizedTripId}.`,
+        `[TelemetrySyncManager] No unsynced telemetry rows for trip ${normalizedTripId}.`,
       );
-    } catch (error) {
-      console.error(
-        `[TelemetrySyncManager] Telemetry sync cycle failed for trip ${normalizedTripId}:`,
-        error,
+      return;
+    }
+
+    const serialized = this.serializeTelemetrySlice(normalizedTripId, batch);
+    const encodedPayload = this.base45Encode(serialized);
+    const deviceSecret = await this.dependencies.getDeviceSecret();
+    const idempotencyKey = await CryptoSignatureEngine.generateStrongSignature(
+      `${normalizedTripId}\n${batch.map((ping) => ping.id ?? '').join(',')}\n${encodedPayload}`,
+      deviceSecret,
+    );
+
+    const networkState = await this.resolveConnectivityState();
+    const dispatched = await this.dispatchBatch(
+      normalizedTripId,
+      encodedPayload,
+      batch.length,
+      idempotencyKey,
+      networkState,
+    );
+
+    if (!dispatched) {
+      throw new Error(
+        `[TelemetrySyncManager] Telemetry batch was not acknowledged by the server for trip ${normalizedTripId}.`,
       );
     }
+
+    const idsToClear = batch
+      .map((ping) => ping.id)
+      .filter((id): id is number => typeof id === 'number');
+
+    await repository.clearSyncedPings(idsToClear);
+
+    console.log(
+      `[TelemetrySyncManager] Cleared ${idsToClear.length} server-acknowledged telemetry row(s) ` +
+        `for trip ${normalizedTripId}.`,
+    );
   }
 
   /**
@@ -361,14 +361,15 @@ export class TelemetrySyncManager {
     tripId: string,
     encodedPayload: string,
     pointCount: number,
+    idempotencyKey: string,
     state: ConnectivityState,
   ): Promise<boolean> {
     if (state === 'internet') {
-      return this.dispatchViaHttps(tripId, encodedPayload, pointCount);
+      return this.dispatchViaHttps(tripId, encodedPayload, pointCount, idempotencyKey);
     }
 
     if (state === 'sms_only' || state === 'none') {
-      return this.dispatchViaSms(tripId, encodedPayload, pointCount);
+      return this.dispatchViaSms(tripId, encodedPayload, pointCount, idempotencyKey);
     }
 
     return false;
@@ -378,6 +379,7 @@ export class TelemetrySyncManager {
     tripId: string,
     encodedPayload: string,
     pointCount: number,
+    idempotencyKey: string,
   ): Promise<boolean> {
     const endpoint = `${(this.dependencies.apiBaseUrl ?? resolveApiBaseUrl()).replace(/\/$/, '')}/api/v1/telemetry/batch`;
 
@@ -385,6 +387,7 @@ export class TelemetrySyncManager {
       trip_id: tripId,
       payload_b45: encodedPayload,
       point_count: pointCount,
+      idempotency_key: idempotencyKey,
     };
 
     try {
@@ -392,8 +395,14 @@ export class TelemetrySyncManager {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          'X-Kona-Driver-Id': await this.dependencies.getDriverId(),
+          'X-Kona-Signature': await CryptoSignatureEngine.generateStrongSignature(
+            telemetrySignaturePayload(payload),
+            await this.dependencies.getDeviceSecret(),
+          ),
         },
         body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(10_000),
       });
 
       if (response.status !== 200) {
@@ -403,6 +412,16 @@ export class TelemetrySyncManager {
         return false;
       }
 
+      const acknowledgement: unknown = await response.json();
+      if (
+        !acknowledgement ||
+        typeof acknowledgement !== 'object' ||
+        (acknowledgement as Record<string, unknown>).status !== 'ok' ||
+        (acknowledgement as Record<string, unknown>).acceptedPoints !== pointCount
+      ) {
+        console.warn('[TelemetrySyncManager] HTTPS telemetry acknowledgement was invalid.');
+        return false;
+      }
       return true;
     } catch (httpError) {
       console.error('[TelemetrySyncManager] HTTPS telemetry batch transport failed:', httpError);
@@ -414,6 +433,7 @@ export class TelemetrySyncManager {
     tripId: string,
     encodedPayload: string,
     pointCount: number,
+    idempotencyKey: string,
   ): Promise<boolean> {
     try {
       const smsTransport = await SMSTransportManager.create();
@@ -424,15 +444,22 @@ export class TelemetrySyncManager {
             trip_id: tripId,
             payload_b45: encodedPayload,
             point_count: pointCount,
+            idempotency_key: idempotencyKey,
           }),
           'utf8',
         ),
       );
-      return smsTransport.sendPayloadAsChunks(
+      const acceptedByCarrier = await smsTransport.sendPayloadAsChunks(
         envelope,
         'TELEMETRY',
         await this.dependencies.getDeviceSecret(),
       );
+      if (acceptedByCarrier) {
+        console.warn(
+          '[TelemetrySyncManager] SMS carrier accepted the batch, but no server acknowledgement is available; retaining local points.',
+        );
+      }
+      return false;
     } catch (smsError) {
       console.error('[TelemetrySyncManager] SMS telemetry batch transport failed:', smsError);
       return false;
