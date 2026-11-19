@@ -26,6 +26,8 @@ jest.mock('expo-sqlite', () => {
     created_at: number;
     attempt_count: number;
     last_attempt_at: number | null;
+    next_attempt_at: number | null;
+    awaiting_server_ack: number;
     synced_at: number | null;
     sync_status: string;
     previous_row_hash: string;
@@ -60,6 +62,8 @@ jest.mock('expo-sqlite', () => {
             created_at: createdAt,
             attempt_count: 0,
             last_attempt_at: null,
+            next_attempt_at: null,
+            awaiting_server_ack: 0,
             synced_at: null,
             sync_status: 'pending',
             previous_row_hash: previousRowHash,
@@ -75,12 +79,16 @@ jest.mock('expo-sqlite', () => {
             if (/sync_status = 'synced'/i.test(sql)) {
               row.sync_status = 'synced';
               row.synced_at = params[0] as number;
+              row.next_attempt_at = null;
+              row.awaiting_server_ack = 0;
             } else if (/sync_status\s*=\s*'failed'/i.test(sql)) {
               row.sync_status = 'failed';
               row.last_attempt_at = params[0] as number;
-            } else if (/attempt_count = attempt_count \+ 1/i.test(sql)) {
+            } else if (/attempt_count\s*=\s*attempt_count\s*\+\s*1/i.test(sql)) {
               row.attempt_count += 1;
               row.last_attempt_at = params[0] as number;
+              row.next_attempt_at = params[1] as number | null;
+              if (params[2] === 1) row.awaiting_server_ack = 1;
             }
           }
           return { changes: 1, lastInsertRowId: -1 };
@@ -91,10 +99,25 @@ jest.mock('expo-sqlite', () => {
     ),
 
     getAllAsync: jest.fn().mockImplementation(
-      async (sql: string, limit: unknown): Promise<MockRow[]> => {
-        if (/WHERE sync_status = 'pending'/i.test(sql)) {
+      async (sql: string, ...params: unknown[]): Promise<MockRow[]> => {
+        if (/sync_status = 'pending'/i.test(sql)) {
+          let rows = store.filter((row) => row.sync_status === 'pending');
+          if (/NOT EXISTS/i.test(sql)) {
+            const now = params[0] as number;
+            rows = rows.filter(
+              (row) =>
+                (row.next_attempt_at === null || row.next_attempt_at <= now) &&
+                !store.some(
+                  (earlier) =>
+                    earlier.sync_status === 'pending' &&
+                    earlier.order_id === row.order_id &&
+                    earlier.id < row.id,
+                ),
+            );
+          }
+          const limit = params[params.length - 1];
           const cap = typeof limit === 'number' ? limit : 50;
-          return store.filter((r) => r.sync_status === 'pending').slice(0, cap);
+          return rows.slice(0, cap);
         }
         return [];
       },
@@ -200,8 +223,11 @@ import { base45Decode, utf8Decode } from '../../utils/TelephonyBridge';
 
 function getMockStore(): Array<{
   idempotency_key: string;
+  order_id: string;
   action_type: string;
   attempt_count: number;
+  next_attempt_at: number | null;
+  awaiting_server_ack: number;
   sync_status: string;
 }> {
   const mod = SQLiteMod as unknown as Record<string, unknown>;
@@ -450,10 +476,15 @@ describe('Phase 3 Ã¢â‚¬â€ connectivity: sms_only', () => {
 
   afterAll(() => resetMockStore());
 
-  it('routes order_status_update through SMS', () => {
+  it('keeps SMS-carrier-accepted actions pending until server acknowledgment', () => {
     const os = results.find((r) => r.action_type === 'order_status_update');
-    expect(os?.outcome).toBe('synced_sms');
+    expect(os?.outcome).toBe('retry_scheduled');
     expect(os?.transmission_path).toBe('sms');
+
+    const queued = getMockStore().find((row) => row.action_type === 'order_status_update');
+    expect(queued?.sync_status).toBe('pending');
+    expect(queued?.awaiting_server_ack).toBe(1);
+    expect(queued?.next_attempt_at).toBeGreaterThan(Date.now());
   });
 
   it('permanently fails dispatch_offer_response at the retry ceiling', () => {
@@ -470,6 +501,67 @@ describe('Phase 3 Ã¢â‚¬â€ connectivity: sms_only', () => {
       (r) => r.action_type === 'dispatch_offer_response',
     );
     expect(failedEntry?.sync_status).toBe('failed');
+  });
+});
+
+describe('Persisted retry scheduling', () => {
+  afterEach(() => resetMockStore());
+
+  it('does not retry a failed action until its persisted backoff time is due', async () => {
+    resetMockStore();
+    await initDatabase();
+    const queued = await queueOfflineTransaction(
+      'retry-window-order',
+      'booking_reversal',
+      { reason: 'temporary outage' },
+      DEVICE_SECRET,
+    );
+    const httpAdapter = makeHttpsAdapter(['booking_reversal']);
+    const manager = new SyncManager({
+      connectivityProbe: { getState: () => 'internet' },
+      httpsAdapter: httpAdapter,
+      smsAdapter: makeSmsAdapter(),
+    });
+
+    const firstReport = await manager.processOfflineQueue();
+    expect(firstReport.retried).toBe(1);
+    expect(getMockStore()[0]?.next_attempt_at).toBeGreaterThan(Date.now());
+
+    const secondReport = await manager.processOfflineQueue();
+    expect(secondReport.total_entries_processed).toBe(0);
+    expect(getMockStore().find((row) => row.idempotency_key === queued.idempotency_key))
+      .toMatchObject({ attempt_count: 1, sync_status: 'pending' });
+  });
+
+  it('releases the queue processing lock when the connectivity probe rejects', async () => {
+    resetMockStore();
+    await initDatabase();
+    await queueOfflineTransaction(
+      'probe-error-order',
+      'booking_lock',
+      { fare_minor: 10 },
+      DEVICE_SECRET,
+    );
+
+    let rejectProbe = true;
+    const manager = new SyncManager({
+      connectivityProbe: {
+        getState: () => {
+          if (rejectProbe) {
+            throw new Error('connectivity unavailable');
+          }
+          return 'none';
+        },
+      },
+      httpsAdapter: makeHttpsAdapter(),
+      smsAdapter: makeSmsAdapter(),
+    });
+
+    await expect(manager.processOfflineQueue()).rejects.toThrow('connectivity unavailable');
+    rejectProbe = false;
+    await expect(manager.processOfflineQueue()).resolves.toMatchObject({
+      skipped_no_connectivity: 1,
+    });
   });
 });
 

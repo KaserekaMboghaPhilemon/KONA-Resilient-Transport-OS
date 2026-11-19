@@ -52,6 +52,8 @@ export interface QueueEntry {
   created_at: number;
   attempt_count: number;
   last_attempt_at: number | null;
+  next_attempt_at?: number | null;
+  awaiting_server_ack?: number;
   synced_at: number | null;
   sync_status: QueueSyncStatus;
   /** Hash of the row immediately preceding this one in the ledger chain. */
@@ -86,8 +88,8 @@ const DB_FILENAME = 'kona_local_cache.db';
  * Append-only queue that captures every transactional state shift while the
  * device has no network access. Once inserted, a row's immutable columns
  * (idempotency_key through created_at) are never written again; only the
- * sync bookkeeping columns (sync_status, attempt_count, last_attempt_at,
- * synced_at) change after initial insertion.
+ * sync bookkeeping columns (sync_status, attempt_count, retry timing, and
+ * acknowledgement state) change after initial insertion.
  */
 const SQL_CREATE_OFFLINE_SYNC_QUEUE = `
   CREATE TABLE IF NOT EXISTS offline_sync_queue (
@@ -99,6 +101,8 @@ const SQL_CREATE_OFFLINE_SYNC_QUEUE = `
     created_at          INTEGER  NOT NULL,
     attempt_count       INTEGER  NOT NULL DEFAULT 0,
     last_attempt_at     INTEGER  NULL,
+    next_attempt_at     INTEGER  NULL,
+    awaiting_server_ack INTEGER  NOT NULL DEFAULT 0,
     synced_at           INTEGER  NULL,
     sync_status         TEXT     NOT NULL DEFAULT 'pending',
     previous_row_hash   TEXT     NOT NULL DEFAULT 'GENESIS_BLOCK_ANCHOR_00000000',
@@ -148,6 +152,25 @@ export async function initDatabase(): Promise<SQLite.SQLiteDatabase> {
   await db.execAsync(SQL_CREATE_OFFLINE_SYNC_QUEUE);
   await db.execAsync(SQL_CREATE_SYNC_INDEX);
   await db.execAsync(SQL_CREATE_RUNTIME_STATE);
+
+  const queueColumns = await db.getAllAsync<{ name: string }>(
+    'PRAGMA table_info(offline_sync_queue)',
+  );
+  if (!queueColumns.some((column) => column.name === 'next_attempt_at')) {
+    await db.execAsync(
+      'ALTER TABLE offline_sync_queue ADD COLUMN next_attempt_at INTEGER NULL',
+    );
+  }
+  if (!queueColumns.some((column) => column.name === 'awaiting_server_ack')) {
+    await db.execAsync(
+      'ALTER TABLE offline_sync_queue ADD COLUMN awaiting_server_ack INTEGER NOT NULL DEFAULT 0',
+    );
+  }
+
+  await db.execAsync(`
+    CREATE INDEX IF NOT EXISTS ix_offline_sync_queue_due
+    ON offline_sync_queue (sync_status, next_attempt_at, created_at)
+  `);
 
   _db = db;
   return _db;
@@ -270,7 +293,7 @@ export async function queueOfflineTransaction(
 
 /**
  * Returns up to `limit` pending queue entries ordered oldest-first (FIFO).
- * Called by the sync service when the device regains connectivity.
+ * Use getReadyQueueEntries() when dispatching so retry timestamps are honored.
  */
 export async function getPendingQueueEntries(limit = 50): Promise<QueueEntry[]> {
   const db = requireDatabase();
@@ -279,6 +302,35 @@ export async function getPendingQueueEntries(limit = 50): Promise<QueueEntry[]> 
      WHERE sync_status = 'pending'
      ORDER BY created_at ASC
      LIMIT ?`,
+    limit,
+  );
+}
+
+/**
+ * Returns due pending actions, retaining FIFO order per order_id. A delayed
+ * earlier action blocks later actions for that order but not other orders.
+ */
+export async function getReadyQueueEntries(limit = 50): Promise<QueueEntry[]> {
+  if (!Number.isInteger(limit) || limit < 1) {
+    throw new RangeError('[getReadyQueueEntries] limit must be a positive integer.');
+  }
+
+  const db = requireDatabase();
+  return db.getAllAsync<QueueEntry>(
+    `SELECT current.*
+     FROM offline_sync_queue AS current
+     WHERE current.sync_status = 'pending'
+       AND (current.next_attempt_at IS NULL OR current.next_attempt_at <= ?)
+       AND NOT EXISTS (
+         SELECT 1
+         FROM offline_sync_queue AS earlier
+         WHERE earlier.order_id = current.order_id
+           AND earlier.sync_status = 'pending'
+           AND earlier.id < current.id
+       )
+     ORDER BY current.created_at ASC, current.id ASC
+     LIMIT ?`,
+    Date.now(),
     limit,
   );
 }
@@ -335,7 +387,9 @@ export async function markQueueEntryAsSynced(idempotencyKey: string): Promise<vo
   await db.runAsync(
     `UPDATE offline_sync_queue
      SET sync_status = 'synced',
-         synced_at   = ?
+         synced_at   = ?,
+         next_attempt_at = NULL,
+         awaiting_server_ack = 0
      WHERE idempotency_key = ?`,
     Date.now(),
     idempotencyKey,
@@ -343,14 +397,23 @@ export async function markQueueEntryAsSynced(idempotencyKey: string): Promise<vo
 }
 
 /** Increments the retry counter and records the timestamp of the most recent attempt. */
-export async function incrementQueueEntryAttemptCount(idempotencyKey: string): Promise<void> {
+export async function incrementQueueEntryAttemptCount(
+  idempotencyKey: string,
+  nextAttemptAt: number | null = null,
+  awaitingServerAck = false,
+): Promise<void> {
   const db = requireDatabase();
   await db.runAsync(
     `UPDATE offline_sync_queue
      SET attempt_count   = attempt_count + 1,
-         last_attempt_at = ?
+         last_attempt_at = ?,
+         next_attempt_at = ?,
+         awaiting_server_ack =
+           CASE WHEN ? = 1 THEN 1 ELSE awaiting_server_ack END
      WHERE idempotency_key = ?`,
     Date.now(),
+    nextAttemptAt,
+    awaitingServerAck ? 1 : 0,
     idempotencyKey,
   );
 }
@@ -361,7 +424,9 @@ export async function markQueueEntryAsFailed(idempotencyKey: string): Promise<vo
   await db.runAsync(
     `UPDATE offline_sync_queue
      SET sync_status     = 'failed',
-         last_attempt_at = ?
+         last_attempt_at = ?,
+         next_attempt_at = NULL,
+         awaiting_server_ack = 0
      WHERE idempotency_key = ?`,
     Date.now(),
     idempotencyKey,

@@ -68,13 +68,19 @@ export class SQLiteTelemetryRepository {
   /**
    * Retrieves all unsynced telemetry rows for a trip in chronological order.
    */
-  async getUnsyncedPings(tripId: string): Promise<TelemetryPing[]> {
+  async getUnsyncedPings(tripId: string, limit?: number): Promise<TelemetryPing[]> {
+    if (limit !== undefined && (!Number.isInteger(limit) || limit < 1)) {
+      throw new RangeError('[SQLiteTelemetryRepository] limit must be a positive integer.');
+    }
+
+    const limitClause = limit === undefined ? '' : ' LIMIT ?';
+    const params = limit === undefined ? [tripId] : [tripId, limit];
     const rows = await this.db.getAllAsync<TelemetryBufferRow>(
       `SELECT id, trip_id, latitude, longitude, speed, heading, timestamp
        FROM driver_telemetry_buffer
        WHERE trip_id = ? AND is_synced = 0
-       ORDER BY timestamp ASC;`,
-      [tripId],
+       ORDER BY timestamp ASC${limitClause};`,
+      params,
     );
 
     return rows.map((row) => ({
@@ -86,6 +92,21 @@ export class SQLiteTelemetryRepository {
       heading: row.heading,
       timestamp: row.timestamp,
     }));
+  }
+
+  async countUnsyncedPings(tripId: string): Promise<number> {
+    const row = await this.db.getFirstAsync<{ count: number }>(
+      `SELECT COUNT(*) AS count
+       FROM driver_telemetry_buffer
+       WHERE trip_id = ? AND is_synced = 0`,
+      [tripId],
+    );
+    if (!row || !Number.isInteger(row.count) || row.count < 0) {
+      throw new Error(
+        '[SQLiteTelemetryRepository] Failed to read an unsynced telemetry count.',
+      );
+    }
+    return row.count;
   }
 
   /**

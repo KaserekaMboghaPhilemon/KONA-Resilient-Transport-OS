@@ -40,6 +40,7 @@ const mockSendPayloadAsChunks = jest.fn();
 const mockTelemetryRepository = {
   initialize: mockInitializeRepository,
   getUnsyncedPings: mockGetUnsyncedPings,
+  countUnsyncedPings: jest.fn().mockResolvedValue(1),
   clearSyncedPings: mockClearSyncedPings,
 };
 
@@ -190,6 +191,18 @@ describe('TelemetrySyncManager – Task 9.4 Periodic Daemon & Backoff', () => {
       // processTelemetrySync should have been called exactly once (for trip-002).
       expect(spy).toHaveBeenCalledTimes(1);
       expect(spy).toHaveBeenCalledWith('trip-002');
+    });
+
+    it('preserves accumulated failures when the same trip daemon is resumed', async () => {
+      jest.useFakeTimers();
+      stubProcessSync().mockRejectedValue(new Error('temporary outage'));
+      await expect(TelemetrySyncManager.forceTelemetrySync('trip-001')).rejects.toThrow(
+        'temporary outage',
+      );
+
+      expect(TelemetrySyncManager.getConsecutiveFailures()).toBe(1);
+      TelemetrySyncManager.startPeriodicSync('trip-001');
+      expect(TelemetrySyncManager.getConsecutiveFailures()).toBe(1);
     });
   });
 
@@ -426,6 +439,7 @@ describe('TelemetrySyncManager – Task 9.4 Periodic Daemon & Backoff', () => {
 
         await expect(TelemetrySyncManager.processTelemetrySync('trip-001')).resolves.toBeUndefined();
 
+        expect(mockGetUnsyncedPings).toHaveBeenCalledWith('trip-001', 10);
         expect(mockClearSyncedPings).toHaveBeenCalledWith([21]);
         expect(global.fetch).toHaveBeenCalledWith(
           'https://kona.example/api/v1/telemetry/batch',
@@ -460,6 +474,21 @@ describe('TelemetrySyncManager – Task 9.4 Periodic Daemon & Backoff', () => {
         );
         expect(mockSendPayloadAsChunks).toHaveBeenCalled();
         expect(mockClearSyncedPings).not.toHaveBeenCalled();
+      });
+
+      it('shares an in-flight batch so concurrent cycles do not duplicate uploads', async () => {
+        global.fetch = jest.fn().mockResolvedValue({
+          status: 200,
+          json: async () => ({ status: 'ok', acceptedPoints: 1 }),
+        }) as unknown as typeof fetch;
+
+        await Promise.all([
+          TelemetrySyncManager.processTelemetrySync('trip-001'),
+          TelemetrySyncManager.processTelemetrySync('trip-001'),
+        ]);
+
+        expect(global.fetch).toHaveBeenCalledTimes(1);
+        expect(mockClearSyncedPings).toHaveBeenCalledTimes(1);
       });
     });
   });

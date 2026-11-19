@@ -11,8 +11,8 @@
  *      KONA central API, and marks the entry as synced on 2xx.
  *
  *   2. SMS path    — when internet is entirely unavailable but an SMS gateway
- *      link is detected. Encodes the payload through the Sprint 3 Base45
- *      Base45-encodes a canonical action envelope and dispatches it via native SMS.
+ *      link is detected. Carrier acceptance leaves the entry pending until the
+ *      backend later acknowledges it through the idempotent HTTPS path.
  *
  * Retry circuitry:
  *   Each transmission failure increments the entry's attempt_count via
@@ -32,7 +32,7 @@
  */
 
 import {
-  getPendingQueueEntries,
+  getReadyQueueEntries,
   markQueueEntryAsSynced,
   incrementQueueEntryAttemptCount,
   markQueueEntryAsFailed,
@@ -275,23 +275,25 @@ export class SyncManager {
    * promptly without waiting for a state transition event.
    */
   private async checkConnectivityAndTrigger(): Promise<void> {
-    const currentState = await this.connectivityProbe.getState();
+    try {
+      const currentState = await this.connectivityProbe.getState();
+      const wasOffline = this.lastKnownState === 'none';
+      const isNowActive = currentState === 'internet' || currentState === 'sms_only';
+      this.lastKnownState = currentState;
 
-    const wasOffline = this.lastKnownState === 'none';
-    const isNowActive =
-      currentState === 'internet' || currentState === 'sms_only';
-
-    this.lastKnownState = currentState;
-
-    if (isNowActive && !this.isProcessing) {
-      if (wasOffline) {
-        // Reconnection event: log the transition for observability.
-        console.log(
-          `[SyncManager] Connectivity restored: ${currentState}. ` +
-            `Triggering offline queue replay.`,
-        );
+      if (isNowActive && !this.isProcessing) {
+        if (wasOffline) {
+          console.log(
+            `[SyncManager] Connectivity restored: ${currentState}. ` +
+              `Triggering offline queue replay.`,
+          );
+        }
+        void this.processOfflineQueue().catch((error: unknown) => {
+          console.error('[SyncManager] Connectivity-triggered queue replay failed:', error);
+        });
       }
-      void this.processOfflineQueue();
+    } catch (error) {
+      console.error('[SyncManager] Connectivity probe failed:', error);
     }
   }
 
@@ -300,8 +302,8 @@ export class SyncManager {
   // -------------------------------------------------------------------------
 
   /**
-   * Pulls up to QUEUE_BATCH_SIZE pending entries from the offline_sync_queue
-   * in oldest-first (FIFO) order and processes each one sequentially through
+   * Pulls up to QUEUE_BATCH_SIZE due entries from the offline_sync_queue,
+   * preserving FIFO order per order_id, and processes each one sequentially through
    * the adaptive dual-path transmission router.
    *
    * Sequential processing is intentional: the KONA PostgreSQL backend requires
@@ -321,13 +323,10 @@ export class SyncManager {
 
     this.isProcessing = true;
     const startedAt = Date.now();
-    const connectivityAtStart = await this.connectivityProbe.getState();
-    this.lastKnownState = connectivityAtStart;
-
     const report: QueueProcessingReport = {
       started_at: startedAt,
       finished_at: 0,
-      connectivity_at_start: connectivityAtStart,
+      connectivity_at_start: 'none',
       total_entries_processed: 0,
       synced_via_https: 0,
       synced_via_sms: 0,
@@ -338,7 +337,11 @@ export class SyncManager {
     };
 
     try {
-      const pending = await getPendingQueueEntries(QUEUE_BATCH_SIZE);
+      const connectivityAtStart = await this.connectivityProbe.getState();
+      this.lastKnownState = connectivityAtStart;
+      report.connectivity_at_start = connectivityAtStart;
+
+      const pending = await getReadyQueueEntries(QUEUE_BATCH_SIZE);
       report.total_entries_processed = pending.length;
 
       // Build a lookup map from idempotency_key → SyncQueueRow so processEntry
@@ -368,16 +371,6 @@ export class SyncManager {
             break;
         }
 
-        // When an entry requires a backoff delay, honour it here so subsequent
-        // entries in the same batch are not dispatched prematurely while the
-        // backend is under pressure.
-        if (
-          entryResult.outcome === 'retry_scheduled' &&
-          entryResult.backoff_ms !== null &&
-          entryResult.backoff_ms > 0
-        ) {
-          await this.delay(entryResult.backoff_ms);
-        }
       }
     } finally {
       report.finished_at = Date.now();
@@ -419,10 +412,12 @@ export class SyncManager {
       attempt_number: entry.attempt_count + 1,
     };
 
-    // Guard: permanently fail entries that have already exhausted retries.
-    // This handles the case where a previously failed entry was left in
-    // 'pending' state due to an unexpected process termination.
-    if (entry.attempt_count >= MAX_RETRY_ATTEMPTS) {
+    // SMS carrier acceptance is not a server acknowledgement, so those entries
+    // remain retryable beyond the normal attempt ceiling.
+    if (
+      entry.attempt_count >= MAX_RETRY_ATTEMPTS &&
+      entry.awaiting_server_ack !== 1
+    ) {
       await markQueueEntryAsFailed(entry.idempotency_key);
       return {
         ...baseResult,
@@ -531,15 +526,9 @@ export class SyncManager {
    * Encodes the payload through TelephonyBridge.encodeQueuedActionToSMS() and
    * dispatches the resulting Base45 wire string via the injected SMS adapter.
    *
-   * The SMS channel does not provide application-layer delivery confirmation,
-   * so the entry is marked synced as soon as the gateway accepts the message.
-   * The KONA backend is responsible for detecting and handling duplicate SMS
-   * deliveries using the idempotency key embedded in the wire string's UUID
-   * segment.
-   *
-   * On success: markQueueEntryAsSynced() is called.
-   * On failure: incrementQueueEntryAttemptCount() is called, backoff computed,
-   *             and retry or permanent failure decided based on ceiling.
+   * The SMS channel does not provide application-layer delivery confirmation.
+   * A carrier-accepted message remains pending with its idempotency key until
+   * the backend later acknowledges the action over HTTPS.
    */
   private async processEntryViaSms(
     entry: QueueEntry,
@@ -560,25 +549,17 @@ export class SyncManager {
       if (!accepted) {
         throw new Error('SMS adapter returned false without throwing.');
       }
-
-      await markQueueEntryAsSynced(entry.idempotency_key);
-
-      // Keep the append-only outbox row after the gateway accepts the message.
-      const repoRow = this.repoMap.get(entry.idempotency_key);
-      if (repoRow) {
-        await SQLiteSyncRepository.dequeue(repoRow.id);
-      }
-
-      return {
-        ...baseResult,
-        outcome: 'synced_sms',
-        error_message: null,
-        backoff_ms: null,
-        transmission_path: 'sms',
-      };
     } catch (err) {
       return this.handleTransmissionFailure(entry, baseResult, 'sms', err);
     }
+
+    return this.handleTransmissionFailure(
+      entry,
+      baseResult,
+      'sms',
+      new Error('SMS carrier accepted the message; server acknowledgement is still pending.'),
+      true,
+    );
   }
 
   // -------------------------------------------------------------------------
@@ -590,7 +571,8 @@ export class SyncManager {
    *
    * Increments the attempt counter and computes the next backoff interval.
    * If the new attempt count meets or exceeds MAX_RETRY_ATTEMPTS, the entry
-   * is permanently failed and will never be retried again.
+   * is permanently failed unless a carrier-accepted message still awaits a
+   * server acknowledgement.
    *
    * Backoff formula: BASE_BACKOFF_MS × 2^(attempt_count)
    * The exponent uses the post-increment value (entry.attempt_count + 1) so
@@ -603,15 +585,28 @@ export class SyncManager {
     baseResult: Omit<EntryProcessingResult, 'outcome' | 'error_message' | 'backoff_ms' | 'transmission_path'>,
     path: 'https' | 'sms',
     error: unknown,
+    retainUntilAcknowledged = false,
   ): Promise<EntryProcessingResult> {
     const errorMessage =
       error instanceof Error ? error.message : String(error);
 
-    await incrementQueueEntryAttemptCount(entry.idempotency_key);
-
     const newAttemptCount = entry.attempt_count + 1;
+    const awaitingServerAck =
+      retainUntilAcknowledged || entry.awaiting_server_ack === 1;
+    const backoffMs = Math.min(
+      BASE_BACKOFF_MS * Math.pow(2, newAttemptCount),
+      MAX_BACKOFF_MS,
+    );
+    const reachedRetryCeiling =
+      newAttemptCount >= MAX_RETRY_ATTEMPTS && !awaitingServerAck;
 
-    if (newAttemptCount >= MAX_RETRY_ATTEMPTS) {
+    await incrementQueueEntryAttemptCount(
+      entry.idempotency_key,
+      reachedRetryCeiling ? null : Date.now() + backoffMs,
+      retainUntilAcknowledged,
+    );
+
+    if (reachedRetryCeiling) {
       await markQueueEntryAsFailed(entry.idempotency_key);
 
       // Retain the failed entry in the canonical outbox for auditability.
@@ -637,11 +632,6 @@ export class SyncManager {
       await SQLiteSyncRepository.updateStatus(repoRow.id, 'FAILED_BACKOFF');
     }
 
-    const backoffMs = Math.min(
-      BASE_BACKOFF_MS * Math.pow(2, newAttemptCount),
-      MAX_BACKOFF_MS,
-    );
-
     return {
       ...baseResult,
       outcome: 'retry_scheduled',
@@ -654,11 +644,6 @@ export class SyncManager {
   // -------------------------------------------------------------------------
   // Utility helpers
   // -------------------------------------------------------------------------
-
-  /** Returns a promise that resolves after `ms` milliseconds. */
-  private delay(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-  }
 
   /** Constructs a zero-count QueueProcessingReport for early-return cases. */
   private emptyReport(connectivity: ConnectivityState): QueueProcessingReport {
@@ -803,6 +788,7 @@ export async function runSprint4Verification(): Promise<void> {
     created_at: number;
     synced_at: number | null;
     raw_payload: Record<string, unknown>;
+    awaiting_server_ack?: number;
   };
 
   const queue: MockEntry[] = [
@@ -866,7 +852,18 @@ export async function runSprint4Verification(): Promise<void> {
     label: string,
   ): Promise<EntryProcessingResult[]> {
     networkPhase = phase;
-    const pending = queue.filter((e) => !syncedKeys.has(e.idempotency_key) && !failedKeys.has(e.idempotency_key));
+    const phaseKeys =
+      phase === 'internet'
+        ? new Set(['ikey-C', 'ikey-D'])
+        : phase === 'sms_only'
+          ? new Set(['ikey-E', 'ikey-F'])
+          : null;
+    const pending = queue.filter(
+      (entry) =>
+        !syncedKeys.has(entry.idempotency_key) &&
+        !failedKeys.has(entry.idempotency_key) &&
+        (phaseKeys === null || phaseKeys.has(entry.idempotency_key)),
+    );
     const results: EntryProcessingResult[] = [];
 
     for (const entry of pending) {
@@ -879,7 +876,10 @@ export async function runSprint4Verification(): Promise<void> {
       };
 
       // Guard: ceiling already reached.
-      if (entry.attempt_count >= MAX_RETRY_ATTEMPTS) {
+      if (
+        entry.attempt_count >= MAX_RETRY_ATTEMPTS &&
+        entry.awaiting_server_ack !== 1
+      ) {
         failedKeys.add(entry.idempotency_key);
         results.push({
           ...baseResult,
@@ -955,18 +955,23 @@ export async function runSprint4Verification(): Promise<void> {
         );
         const accepted = await mockSmsAdapter.send(wireString);
         if (!accepted) throw new Error('SMS adapter returned false.');
-        syncedKeys.add(entry.idempotency_key);
+        entry.attempt_count += 1;
+        entry.awaiting_server_ack = 1;
+        const backoffMs = Math.min(
+          BASE_BACKOFF_MS * Math.pow(2, entry.attempt_count),
+          MAX_BACKOFF_MS,
+        );
         results.push({
           ...baseResult,
-          outcome: 'synced_sms',
-          error_message: null,
-          backoff_ms: null,
+          outcome: 'retry_scheduled',
+          error_message: 'SMS carrier accepted message; server acknowledgement is pending.',
+          backoff_ms: backoffMs,
           transmission_path: 'sms',
         });
       } catch (err) {
         entry.attempt_count += 1;
         const newCount = entry.attempt_count;
-        if (newCount >= MAX_RETRY_ATTEMPTS) {
+        if (newCount >= MAX_RETRY_ATTEMPTS && entry.awaiting_server_ack !== 1) {
           failedKeys.add(entry.idempotency_key);
           results.push({
             ...baseResult,
@@ -1027,7 +1032,10 @@ export async function runSprint4Verification(): Promise<void> {
   // Phase 3
   const ikey_E = phase3Results.find((r) => r.idempotency_key === 'ikey-E');
   const ikey_F = phase3Results.find((r) => r.idempotency_key === 'ikey-F');
-  assert(ikey_E?.outcome === 'synced_sms', 'Phase 3: entry E must be synced via SMS');
+  assert(
+    ikey_E?.outcome === 'retry_scheduled',
+    'Phase 3: SMS carrier acceptance must retain entry E pending server acknowledgement',
+  );
   assert(ikey_F?.outcome === 'failed_permanently', 'Phase 3: entry F must be permanently failed at ceiling');
   assert(smsCallLog.includes('ORDER_STATUS_UPDATE'), 'Phase 3: SMS call log must contain ORDER_STATUS_UPDATE');
 
@@ -1074,7 +1082,7 @@ export async function runSprint4Verification(): Promise<void> {
       {
         phase: 3,
         connectivity: 'sms_only',
-        description: 'Internet lost — SMS path active, retry ceiling enforced',
+        description: 'Internet lost — SMS accepted entries remain pending for server acknowledgement',
         entries: phase3Results
           .filter((r) => ['ikey-E', 'ikey-F'].includes(r.idempotency_key))
           .map((r) => ({

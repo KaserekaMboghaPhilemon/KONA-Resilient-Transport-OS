@@ -49,6 +49,7 @@ export class TelemetrySyncManager {
   private static periodicTimerHandle: ReturnType<typeof setTimeout> | null = null;
   /** Trip ID currently being tracked by the daemon. */
   private static periodicTripId: string | null = null;
+  private static activeSyncs = new Map<string, Promise<void>>();
   /** Consecutive failures since the last successful cycle. */
   private static consecutiveFailures = 0;
   /** Timestamp (ms since epoch) when the next sync cycle will fire. */
@@ -85,14 +86,14 @@ export class TelemetrySyncManager {
   /**
    * Starts the recurring telemetry batch pump for the given trip.
    *
-   * Resets the consecutive-failure counter and schedules the first execution
-   * immediately at the baseline interval. Each cycle calls processTelemetrySync()
+   * Resets failures only when switching trips and schedules the first execution
+   * at the baseline interval. Each cycle calls processTelemetrySync()
    * and re-schedules itself:
    *  - On success or no-op → resets failures → next tick at TELEMETRY_BASE_INTERVAL_MS.
    *  - On exception → increments failures → next tick at min(base × 2^failures, max).
    *
    * Calling startPeriodicSync() while a daemon is already running replaces the
-   * existing loop (the prior timer is cleared before the new one is installed).
+   * timer without discarding the same trip's accumulated retry state.
    */
   public static startPeriodicSync(tripId: string): void {
     const normalizedTripId = tripId.trim();
@@ -100,11 +101,13 @@ export class TelemetrySyncManager {
       throw new TypeError('[TelemetrySyncManager] startPeriodicSync requires a non-empty tripId.');
     }
 
-    // Clear any existing daemon loop before replacing it.
+    const sameTrip = this.periodicTripId === normalizedTripId;
     this.stopPeriodicSync();
 
     this.periodicTripId = normalizedTripId;
-    this.consecutiveFailures = 0;
+    if (!sameTrip) {
+      this.consecutiveFailures = 0;
+    }
 
     console.log(
       `[TelemetrySyncManager] Starting periodic telemetry daemon for trip ${normalizedTripId} ` +
@@ -124,6 +127,7 @@ export class TelemetrySyncManager {
       this.periodicTimerHandle = null;
     }
     this.periodicTripId = null;
+    this.nextSyncTimestamp = null;
     console.log('[TelemetrySyncManager] Periodic telemetry daemon stopped.');
   }
 
@@ -142,8 +146,12 @@ export class TelemetrySyncManager {
    * The tick runs processTelemetrySync() and immediately re-schedules itself.
    */
   private static scheduleNextCycle(delayMs: number): void {
+    if (this.periodicTimerHandle !== null) {
+      clearTimeout(this.periodicTimerHandle);
+    }
     this.nextSyncTimestamp = Date.now() + delayMs;
     this.periodicTimerHandle = setTimeout(() => {
+      this.periodicTimerHandle = null;
       void this.runOneCycle();
     }, delayMs);
   }
@@ -168,26 +176,16 @@ export class TelemetrySyncManager {
   }
 
   /**
-   * Returns the count of unsynced telemetry pings for the given trip,
-   * or 0 if the repository is unavailable.
+   * Returns the count of unsynced telemetry pings for the given trip.
    */
   public static async getUnsyncedPingCount(tripId: string): Promise<number> {
-    try {
-      const repository = await this.getTelemetryRepository();
-      const pings = await repository.getUnsyncedPings(tripId);
-      return pings.length;
-    } catch (error) {
-      console.warn(
-        `[TelemetrySyncManager] Failed to query unsynced ping count for trip ${tripId}:`,
-        error,
-      );
-      return 0;
-    }
+    const repository = await this.getTelemetryRepository();
+    return repository.countUnsyncedPings(tripId);
   }
 
   /**
    * Manually triggers an immediate telemetry sync, bypassing the current delay.
-   * Success resets backoff; failure increments it and schedules a delayed retry.
+   * Success resets backoff; failure records backoff, schedules retry, and rejects.
    *
    * Safe to call multiple times; internally guards against concurrent execution.
    */
@@ -195,6 +193,10 @@ export class TelemetrySyncManager {
     const normalizedTripId = tripId.trim();
     if (!normalizedTripId) {
       throw new TypeError('[TelemetrySyncManager] forceTelemetrySync requires a non-empty tripId.');
+    }
+
+    if (this.activeSyncs.has(normalizedTripId)) {
+      return this.activeSyncs.get(normalizedTripId);
     }
 
     if (this.periodicTimerHandle !== null) {
@@ -225,11 +227,12 @@ export class TelemetrySyncManager {
       );
       this.consecutiveFailures += 1;
       this.scheduleNextCycle(this.computeBackoffDelay(this.consecutiveFailures));
+      throw error;
     }
   }
 
   /**
-   * Executes one telemetry sync cycle and schedules the subsequent tick.
+   * Executes one telemetry sync cycle and schedules the subsequent tick unless stopped.
    */
   private static async runOneCycle(): Promise<void> {
     const tripId = this.periodicTripId;
@@ -241,6 +244,9 @@ export class TelemetrySyncManager {
 
     try {
       await this.processTelemetrySync(tripId);
+      if (this.periodicTripId !== tripId) {
+        return;
+      }
 
       // Cycle completed without throwing — treat as success regardless of whether
       // any rows were found (a no-op empty batch is still a healthy execution).
@@ -252,6 +258,10 @@ export class TelemetrySyncManager {
           `Next cycle in ${TELEMETRY_BASE_INTERVAL_MS} ms.`,
       );
     } catch (cycleError) {
+      if (this.periodicTripId !== tripId) {
+        return;
+      }
+
       this.consecutiveFailures += 1;
       const nextDelay = this.computeBackoffDelay(this.consecutiveFailures);
 
@@ -271,9 +281,28 @@ export class TelemetrySyncManager {
       throw new TypeError('[TelemetrySyncManager] processTelemetrySync requires a non-empty tripId.');
     }
 
+    const activeSync = this.activeSyncs.get(normalizedTripId);
+    if (activeSync) {
+      return activeSync;
+    }
+
+    const syncPromise = this.processTelemetryBatch(normalizedTripId);
+    this.activeSyncs.set(normalizedTripId, syncPromise);
+    try {
+      await syncPromise;
+    } finally {
+      if (this.activeSyncs.get(normalizedTripId) === syncPromise) {
+        this.activeSyncs.delete(normalizedTripId);
+      }
+    }
+  }
+
+  private static async processTelemetryBatch(normalizedTripId: string): Promise<void> {
     const repository = await this.getTelemetryRepository();
-    const unsynced = await repository.getUnsyncedPings(normalizedTripId);
-    const batch = unsynced.slice(0, TELEMETRY_BATCH_LIMIT);
+    const batch = await repository.getUnsyncedPings(
+      normalizedTripId,
+      TELEMETRY_BATCH_LIMIT,
+    );
 
     if (batch.length === 0) {
       console.log(

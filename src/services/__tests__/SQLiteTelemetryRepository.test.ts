@@ -71,7 +71,7 @@ function createMockDatabase(): {
 
     getAllAsync: jest.fn(async (_sql: string, params?: unknown[]) => {
       const tripId = params?.[0] as string;
-      return store
+      const sorted = store
         .filter((row) => row.trip_id === tripId && row.is_synced === 0)
         .sort((a, b) => a.timestamp - b.timestamp)
         .map((row) => ({
@@ -83,6 +83,17 @@ function createMockDatabase(): {
           heading: row.heading,
           timestamp: row.timestamp,
         }));
+      const limit = params?.[1];
+      return typeof limit === 'number' ? sorted.slice(0, limit) : sorted;
+    }),
+
+    getFirstAsync: jest.fn(async (_sql: string, params?: unknown[]) => {
+      const tripId = params?.[0] as string;
+      return {
+        count: store.filter(
+          (row) => row.trip_id === tripId && row.is_synced === 0,
+        ).length,
+      };
     }),
   } as unknown as SQLite.SQLiteDatabase;
 
@@ -196,5 +207,48 @@ describe('SQLiteTelemetryRepository', () => {
     const repo = new SQLiteTelemetryRepository(db);
 
     await expect(repo.clearSyncedPings([])).resolves.toBeUndefined();
+  });
+
+  it('limits database reads to the requested chronological batch size', async () => {
+    const { db } = createMockDatabase();
+    const repo = new SQLiteTelemetryRepository(db);
+
+    for (let timestamp = 3; timestamp >= 1; timestamp--) {
+      await repo.logPing({
+        tripId: 'trip-bounded',
+        latitude: 0,
+        longitude: 0,
+        speed: null,
+        heading: null,
+        timestamp,
+      });
+    }
+
+    const batch = await repo.getUnsyncedPings('trip-bounded', 2);
+
+    expect(batch.map((ping) => ping.timestamp)).toEqual([1, 2]);
+    expect(db.getAllAsync).toHaveBeenLastCalledWith(
+      expect.stringContaining('LIMIT ?'),
+      ['trip-bounded', 2],
+    );
+  });
+
+  it('counts unsynced rows without loading full ping payloads', async () => {
+    const { db } = createMockDatabase();
+    const repo = new SQLiteTelemetryRepository(db);
+    await repo.logPing({
+      tripId: 'trip-count',
+      latitude: 0,
+      longitude: 0,
+      speed: null,
+      heading: null,
+      timestamp: 1,
+    });
+
+    await expect(repo.countUnsyncedPings('trip-count')).resolves.toBe(1);
+    expect(db.getFirstAsync).toHaveBeenCalledWith(
+      expect.stringContaining('COUNT(*)'),
+      ['trip-count'],
+    );
   });
 });

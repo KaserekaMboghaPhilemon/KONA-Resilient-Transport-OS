@@ -227,8 +227,8 @@ function useConnectivity(probe: ConnectivityProbe): ConnectivityState {
       try {
         const s = await probe.getState();
         if (!cancelled) setState(s);
-      } catch {
-        // Non-fatal — keep last known state and retry on the next tick.
+      } catch (error) {
+        console.warn('[DriverSyncDashboard] Telemetry status refresh failed:', error);
       }
     }
 

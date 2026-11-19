@@ -27,12 +27,13 @@ jest.mock('expo-sqlite', () => {
     created_at: number;
     attempt_count: number;
     last_attempt_at: number | null;
+    next_attempt_at: number | null;
+    awaiting_server_ack: number;
     synced_at: number | null;
     sync_status: string;
     previous_row_hash: string;
     row_signature: string;
   };
-
   const store: MockRow[] = [];
   let nextId = 0;
   let activeTripId: string | null = null;
@@ -77,6 +78,8 @@ jest.mock('expo-sqlite', () => {
             created_at: createdAt,
             attempt_count: 0,
             last_attempt_at: null,
+            next_attempt_at: null,
+            awaiting_server_ack: 0,
             synced_at: null,
             sync_status: 'pending',
             previous_row_hash: previousRowHash,
@@ -92,12 +95,16 @@ jest.mock('expo-sqlite', () => {
             if (/sync_status = 'synced'/i.test(sql)) {
               row.sync_status = 'synced';
               row.synced_at = params[0] as number;
+              row.next_attempt_at = null;
+              row.awaiting_server_ack = 0;
             } else if (/sync_status = 'failed'/i.test(sql)) {
               row.sync_status = 'failed';
               row.last_attempt_at = params[0] as number;
-            } else if (/attempt_count = attempt_count \+ 1/i.test(sql)) {
+            } else if (/attempt_count\s*=\s*attempt_count\s*\+\s*1/i.test(sql)) {
               row.attempt_count += 1;
               row.last_attempt_at = params[0] as number;
+              row.next_attempt_at = params[1] as number | null;
+              if (params[2] === 1) row.awaiting_server_ack = 1;
             }
           }
           return { changes: 1, lastInsertRowId: -1 };
@@ -108,9 +115,26 @@ jest.mock('expo-sqlite', () => {
     ),
 
     getAllAsync: jest.fn().mockImplementation(
-      async (sql: string, ..._rest: unknown[]): Promise<MockRow[]> => {
-        if (/WHERE sync_status = 'pending'/i.test(sql)) {
-          return store.filter((r) => r.sync_status === 'pending');
+      async (sql: string, ...params: unknown[]): Promise<MockRow[]> => {
+        if (/sync_status = 'pending'/i.test(sql)) {
+          let rows = store.filter((row) => row.sync_status === 'pending');
+          if (/NOT EXISTS/i.test(sql)) {
+            const now = params[0] as number;
+            rows = rows.filter(
+              (row) =>
+                (row.next_attempt_at === null || row.next_attempt_at <= now) &&
+                !store.some(
+                  (earlier) =>
+                    earlier.sync_status === 'pending' &&
+                    earlier.order_id === row.order_id &&
+                    earlier.id < row.id,
+                ),
+            );
+            const limit = params[1] as number;
+            return rows.slice(0, limit);
+          }
+          const limit = params[0] as number | undefined;
+          return typeof limit === 'number' ? rows.slice(0, limit) : rows;
         }
         return [];
       },
@@ -120,6 +144,9 @@ jest.mock('expo-sqlite', () => {
       async (
         sql: string,
       ): Promise<{ row_signature: string } | { state_value: string } | null> => {
+        if (/PRAGMA table_info/i.test(sql)) {
+          return null;
+        }
         if (/SELECT\s+state_value\s+FROM local_runtime_state/i.test(sql)) {
           return activeTripId === null ? null : { state_value: activeTripId };
         }
@@ -132,9 +159,15 @@ jest.mock('expo-sqlite', () => {
     ),
     closeAsync: jest.fn().mockResolvedValue(undefined),
   };
+  (mockDb as unknown as Record<string, unknown>).__resetStore = () => {
+    store.splice(0, store.length);
+    nextId = 0;
+    activeTripId = null;
+  };
 
   return {
     openDatabaseAsync: jest.fn().mockResolvedValue(mockDb),
+    __mockDb: mockDb,
   };
 });
 
@@ -178,6 +211,7 @@ import {
   initDatabase,
   queueOfflineTransaction,
   getPendingQueueEntries,
+  getReadyQueueEntries,
   markQueueEntryAsSynced,
   incrementQueueEntryAttemptCount,
   markQueueEntryAsFailed,
@@ -189,6 +223,14 @@ import {
   type QueueEntry,
   type OfflineActionType,
 } from '../LocalDatabase';
+import * as SQLiteMod from 'expo-sqlite';
+
+function resetMockStore(): void {
+  const db = (SQLiteMod as unknown as Record<string, unknown>).__mockDb as
+    | Record<string, unknown>
+    | undefined;
+  (db?.__resetStore as (() => void) | undefined)?.();
+}
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -230,6 +272,46 @@ describe('LocalDatabase - offline_sync_queue', () => {
       await expect(getPersistedActiveTripId()).resolves.toBe('trip-runtime-001');
     });
 
+    describe('retry eligibility', () => {
+      it('holds delayed actions and later actions for the same order while allowing other orders', async () => {
+        const firstAction = await queueOfflineTransaction(
+          'retry-order-001',
+          'booking_lock',
+          { step: 1 },
+          DEVICE_SECRET,
+        );
+        await queueOfflineTransaction(
+          'retry-order-001',
+          'trip_settlement',
+          { step: 2 },
+          DEVICE_SECRET,
+        );
+        const independentAction = await queueOfflineTransaction(
+          'retry-order-002',
+          'booking_lock',
+          { step: 1 },
+          DEVICE_SECRET,
+        );
+        await incrementQueueEntryAttemptCount(
+          firstAction.idempotency_key,
+          Date.now() + 60_000,
+        );
+
+        const readyWhileDelayed = await getReadyQueueEntries();
+        expect(readyWhileDelayed.map((entry) => entry.idempotency_key)).toEqual([
+          independentAction.idempotency_key,
+        ]);
+
+        await markQueueEntryAsSynced(firstAction.idempotency_key);
+        const readyAfterAck = await getReadyQueueEntries();
+        expect(readyAfterAck.map((entry) => entry.order_id)).toContain('retry-order-001');
+      });
+
+      it('rejects invalid ready queue limits', async () => {
+        await expect(getReadyQueueEntries(0)).rejects.toThrow(RangeError);
+      });
+    });
+
     it('clears only the expected active trip context', async () => {
       await persistActiveTripId('trip-runtime-002');
       await clearPersistedActiveTripId('stale-trip');
@@ -249,6 +331,8 @@ describe('LocalDatabase - offline_sync_queue', () => {
   // -------------------------------------------------------------------------
 
   describe('queueOfflineTransaction()', () => {
+    beforeAll(() => resetMockStore());
+
     it('inserts a new row and returns inserted: true with a non-empty idempotency key', async () => {
       const result = await queueOfflineTransaction(
         FIXTURE_ORDER_ID,
