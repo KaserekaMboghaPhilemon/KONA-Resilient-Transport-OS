@@ -44,6 +44,7 @@ interface StateCoordinatorDependencies {
   verifyTableName: string;
   runQueueSync: (tripId: string) => Promise<void>;
   runTelemetrySync: (tripId: string) => Promise<void>;
+  startConnectivityMonitor: () => void | Promise<void>;
   haltOutboundTransports: () => void | Promise<void>;
 }
 
@@ -51,6 +52,7 @@ const DEFAULT_VERIFY_TABLE = CANONICAL_OUTBOX_TABLE;
 
 type SyncManagerLike = {
   processOfflineQueue: () => Promise<unknown>;
+  startConnectivityMonitor: () => void;
   stopConnectivityMonitor: () => void;
 };
 
@@ -69,6 +71,10 @@ function createDefaultDependencies(): StateCoordinatorDependencies {
     runTelemetrySync: async (tripId: string) => {
       const { TelemetrySyncManager } = await import('./TelemetrySyncManager');
       await TelemetrySyncManager.forceTelemetrySync(tripId);
+    },
+    startConnectivityMonitor: async () => {
+      const syncManager = await StateCoordinator.getOrCreateDefaultSyncManager();
+      syncManager.startConnectivityMonitor();
     },
     haltOutboundTransports: async () => {
       const syncManager = await StateCoordinator.getOrCreateDefaultSyncManager();
@@ -219,6 +225,20 @@ export class StateCoordinator {
         lastRunFinishedAt: Date.now(),
       };
       this.emit();
+    }
+  }
+
+  public static async prepareRuntimeServices(): Promise<void> {
+    await this.getOrCreateDefaultSyncManager();
+  }
+
+  public static async startRuntimeServices(tripId: string | null): Promise<void> {
+    await this.prepareRuntimeServices();
+    await this.dependencies.startConnectivityMonitor();
+
+    if (tripId) {
+      const { TelemetrySyncManager } = await import('./TelemetrySyncManager');
+      TelemetrySyncManager.startPeriodicSync(tripId);
     }
   }
 

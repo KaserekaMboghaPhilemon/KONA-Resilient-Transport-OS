@@ -250,10 +250,8 @@ export class SyncManager {
       void this.checkConnectivityAndTrigger();
     }, this.monitorIntervalMs);
 
-    // Allow the Node.js event loop to exit even when this interval is active.
-    // Without .unref(), a running monitor prevents Jest workers from exiting
-    // cleanly after tests complete.
-    (this.monitorIntervalHandle as unknown as { unref(): void }).unref();
+    const timerHandle = Object(this.monitorIntervalHandle) as { unref?: () => void };
+    timerHandle.unref?.();
   }
 
   /**

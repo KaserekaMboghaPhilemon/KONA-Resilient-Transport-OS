@@ -216,6 +216,7 @@ jest.mock('expo-haptics', () => ({
 
 jest.mock('../../services/TelemetrySyncManager', () => ({
   TelemetrySyncManager: {
+    configure: jest.fn(),
     getConsecutiveFailures: jest.fn().mockReturnValue(0),
     getNextSyncTimestamp: jest.fn().mockReturnValue(null),
     getUnsyncedPingCount: jest.fn().mockResolvedValue(0),
@@ -224,6 +225,10 @@ jest.mock('../../services/TelemetrySyncManager', () => ({
     stopPeriodicSync: jest.fn(),
     processTelemetrySync: jest.fn().mockResolvedValue(undefined),
   },
+}));
+
+jest.mock('../../services/AppInitializer', () => ({
+  initializeAppWithCrashRecovery: jest.fn().mockResolvedValue(undefined),
 }));
 
 jest.mock('../../hooks/useCoordinatorState', () => ({
@@ -249,6 +254,7 @@ jest.mock('../../services/StateCoordinator', () => {
       configure: jest.fn((params: {
         runQueueSync?: (tripId: string) => Promise<void>;
         runTelemetrySync?: (tripId: string) => Promise<void>;
+        startConnectivityMonitor?: () => void;
       }) => {
         deps = { ...deps, ...params };
       }),

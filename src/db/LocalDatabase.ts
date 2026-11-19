@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Sprint 2 - Edge-State SQLite Local Node Cache
  *
  * Embeds a WAL-journaled SQLite database on the React Native client tier.
@@ -110,6 +110,13 @@ const SQL_CREATE_SYNC_INDEX = `
   CREATE INDEX IF NOT EXISTS ix_offline_sync_queue_status_created
     ON offline_sync_queue (sync_status, created_at ASC)`.trim();
 
+const SQL_CREATE_RUNTIME_STATE = `
+  CREATE TABLE IF NOT EXISTS local_runtime_state (
+    state_key   TEXT PRIMARY KEY,
+    state_value TEXT NOT NULL,
+    updated_at  INTEGER NOT NULL
+  )`.trim();
+
 // ---------------------------------------------------------------------------
 // Initialization
 // ---------------------------------------------------------------------------
@@ -140,6 +147,7 @@ export async function initDatabase(): Promise<SQLite.SQLiteDatabase> {
 
   await db.execAsync(SQL_CREATE_OFFLINE_SYNC_QUEUE);
   await db.execAsync(SQL_CREATE_SYNC_INDEX);
+  await db.execAsync(SQL_CREATE_RUNTIME_STATE);
 
   _db = db;
   return _db;
@@ -272,6 +280,52 @@ export async function getPendingQueueEntries(limit = 50): Promise<QueueEntry[]> 
      ORDER BY created_at ASC
      LIMIT ?`,
     limit,
+  );
+}
+
+export async function persistActiveTripId(tripId: string): Promise<void> {
+  const normalizedTripId = tripId.trim();
+  if (!normalizedTripId) {
+    throw new TypeError('[persistActiveTripId] tripId must be a non-empty string.');
+  }
+
+  const db = requireDatabase();
+  await db.runAsync(
+    `INSERT INTO local_runtime_state (state_key, state_value, updated_at)
+     VALUES ('active_trip_id', ?, ?)
+     ON CONFLICT(state_key) DO UPDATE SET
+       state_value = excluded.state_value,
+       updated_at = excluded.updated_at`,
+    normalizedTripId,
+    Date.now(),
+  );
+}
+
+export async function getPersistedActiveTripId(): Promise<string | null> {
+  const db = requireDatabase();
+  const row = await db.getFirstAsync<{ state_value: string }>(
+    `SELECT state_value
+     FROM local_runtime_state
+     WHERE state_key = 'active_trip_id'`,
+  );
+  return row?.state_value ?? null;
+}
+
+export async function clearPersistedActiveTripId(
+  expectedTripId?: string,
+): Promise<void> {
+  const db = requireDatabase();
+  if (expectedTripId === undefined) {
+    await db.runAsync(
+      `DELETE FROM local_runtime_state WHERE state_key = 'active_trip_id'`,
+    );
+    return;
+  }
+
+  await db.runAsync(
+    `DELETE FROM local_runtime_state
+     WHERE state_key = 'active_trip_id' AND state_value = ?`,
+    expectedTripId,
   );
 }
 

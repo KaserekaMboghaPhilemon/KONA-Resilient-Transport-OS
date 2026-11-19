@@ -52,6 +52,7 @@ import { TelemetrySyncManager } from '../services/TelemetrySyncManager';
 import {
   StateCoordinator,
 } from '../services/StateCoordinator';
+import { initializeAppWithCrashRecovery } from '../services/AppInitializer';
 import { useCoordinatorState } from '../hooks/useCoordinatorState';
 
 import * as Haptics from 'expo-haptics';
@@ -760,6 +761,8 @@ export default function DriverSyncDashboard({
 }: DriverSyncDashboardProps) {
   const coordinatorSnapshot = useCoordinatorState();
   const isMountedRef = useRef(true);
+  const initialTripIdRef = useRef(tripId);
+  const previousTripIdRef = useRef(tripId?.trim() || null);
 
   useEffect(() => {
     isMountedRef.current = true;
@@ -789,6 +792,7 @@ export default function DriverSyncDashboard({
   const [isTelemetryFlushing, setIsTelemetryFlushing] = useState(false);
 
   useEffect(() => {
+    TelemetrySyncManager.configure({ connectivityProbe });
     StateCoordinator.configure({
       runQueueSync: async () => {
         const report = await syncManager.processOfflineQueue();
@@ -801,12 +805,65 @@ export default function DriverSyncDashboard({
       runTelemetrySync: async (coordinatorTripId: string) => {
         await TelemetrySyncManager.forceTelemetrySync(coordinatorTripId);
       },
+      startConnectivityMonitor: () => {
+        syncManager.startConnectivityMonitor();
+      },
       haltOutboundTransports: () => {
         syncManager.stopConnectivityMonitor();
         TelemetrySyncManager.stopPeriodicSync();
       },
     });
-  }, [syncManager]);
+  }, [connectivityProbe, syncManager]);
+
+  useEffect(() => {
+    let isMounted = true;
+    void initializeAppWithCrashRecovery(initialTripIdRef.current).catch((error: unknown) => {
+      if (isMounted) {
+        setSyncError(
+          error instanceof Error ? error.message : 'KONA runtime initialization failed.',
+        );
+      }
+    });
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    const normalizedTripId = tripId?.trim() || null;
+    const previousTripId = previousTripIdRef.current;
+    previousTripIdRef.current = normalizedTripId;
+
+    if (normalizedTripId && normalizedTripId !== previousTripId) {
+      void import('../services/BackgroundLocationWorker')
+        .then(({ BackgroundLocationWorker }) => (
+          BackgroundLocationWorker.startTracking(normalizedTripId)
+        ))
+        .then(() => TelemetrySyncManager.startPeriodicSync(normalizedTripId))
+        .catch((error: unknown) => {
+          if (isMountedRef.current) {
+            setSyncError(
+              error instanceof Error ? error.message : 'Could not start trip background services.',
+            );
+          }
+        });
+      return;
+    }
+
+    if (previousTripId && !normalizedTripId) {
+      void import('../services/BackgroundLocationWorker')
+        .then(({ BackgroundLocationWorker }) => BackgroundLocationWorker.stopTracking())
+        .then(() => TelemetrySyncManager.stopPeriodicSync())
+        .catch((error: unknown) => {
+          if (isMountedRef.current) {
+            setSyncError(
+              error instanceof Error ? error.message : 'Could not stop trip background services.',
+            );
+          }
+        });
+    }
+  }, [tripId]);
 
   // Derived counts for the metric card pills.
   const { freshCount, retryingCount } = useMemo(() => ({

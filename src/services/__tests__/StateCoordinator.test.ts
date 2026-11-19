@@ -1,7 +1,16 @@
 import type * as SQLite from 'expo-sqlite';
 
+jest.mock('../TelemetrySyncManager', () => ({
+  TelemetrySyncManager: {
+    startPeriodicSync: jest.fn(),
+    stopPeriodicSync: jest.fn(),
+    forceTelemetrySync: jest.fn(),
+  },
+}));
+
 import { LocalLedgerGuard } from '../LocalLedgerGuard';
 import { LedgerCompromisedError, StateCoordinator } from '../StateCoordinator';
+import { TelemetrySyncManager } from '../TelemetrySyncManager';
 
 describe('StateCoordinator', () => {
   const DEVICE_SECRET = 'test-device-secret';
@@ -151,6 +160,27 @@ describe('StateCoordinator', () => {
     expect(snapshot.ledgerIntegrityOk).toBe(true);
     expect(snapshot.successfulRuns).toBe(1);
     expect(snapshot.isProcessing).toBe(false);
+  });
+
+  it('starts the reconnection monitor and active-trip telemetry daemon', async () => {
+    const startConnectivityMonitor = jest.fn();
+    const getOrCreateManager = jest
+      .spyOn(StateCoordinator, 'getOrCreateDefaultSyncManager')
+      .mockResolvedValue({
+        processOfflineQueue: jest.fn(),
+        startConnectivityMonitor: jest.fn(),
+        stopConnectivityMonitor: jest.fn(),
+      });
+    const startPeriodicSync = jest
+      .spyOn(TelemetrySyncManager, 'startPeriodicSync')
+      .mockImplementation();
+
+    StateCoordinator.configure({ startConnectivityMonitor });
+    await StateCoordinator.startRuntimeServices('trip-runtime');
+
+    expect(getOrCreateManager).toHaveBeenCalledTimes(1);
+    expect(startConnectivityMonitor).toHaveBeenCalledTimes(1);
+    expect(startPeriodicSync).toHaveBeenCalledWith('trip-runtime');
   });
 
   it('unlocks manually only after a clean post-incident audit', async () => {

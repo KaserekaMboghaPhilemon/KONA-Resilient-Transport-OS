@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Sprint 2 - LocalDatabase offline queue verification
  *
  * Simulates a device operating under complete cellular network loss.
@@ -35,6 +35,7 @@ jest.mock('expo-sqlite', () => {
 
   const store: MockRow[] = [];
   let nextId = 0;
+  let activeTripId: string | null = null;
 
   const mockDb = {
     execAsync: jest.fn().mockResolvedValue(undefined),
@@ -44,6 +45,19 @@ jest.mock('expo-sqlite', () => {
         sql: string,
         ...params: unknown[]
       ): Promise<{ changes: number; lastInsertRowId: number }> => {
+        if (/INSERT INTO local_runtime_state/i.test(sql)) {
+          activeTripId = params[0] as string;
+          return { changes: 1, lastInsertRowId: -1 };
+        }
+
+        if (/DELETE FROM local_runtime_state/i.test(sql)) {
+          const expectedTripId = params[0] as string | undefined;
+          if (expectedTripId === undefined || expectedTripId === activeTripId) {
+            activeTripId = null;
+          }
+          return { changes: 1, lastInsertRowId: -1 };
+        }
+
         if (/INSERT OR IGNORE INTO offline_sync_queue/i.test(sql)) {
           const [idempotencyKey, orderId, actionType, payloadCompressed, createdAt,
                  previousRowHash, rowSignature] =
@@ -103,7 +117,12 @@ jest.mock('expo-sqlite', () => {
     ),
 
     getFirstAsync: jest.fn().mockImplementation(
-      async (sql: string): Promise<{ row_signature: string } | null> => {
+      async (
+        sql: string,
+      ): Promise<{ row_signature: string } | { state_value: string } | null> => {
+        if (/SELECT\s+state_value\s+FROM local_runtime_state/i.test(sql)) {
+          return activeTripId === null ? null : { state_value: activeTripId };
+        }
         if (/SELECT row_signature FROM/i.test(sql)) {
           if (store.length === 0) return null;
           return { row_signature: store[store.length - 1].row_signature };
@@ -162,6 +181,9 @@ import {
   markQueueEntryAsSynced,
   incrementQueueEntryAttemptCount,
   markQueueEntryAsFailed,
+  persistActiveTripId,
+  getPersistedActiveTripId,
+  clearPersistedActiveTripId,
   decompressQueueEntry,
   _resetDatabaseForTesting,
   type QueueEntry,
@@ -199,6 +221,27 @@ describe('LocalDatabase - offline_sync_queue', () => {
 
   afterAll(async () => {
     await _resetDatabaseForTesting();
+  });
+
+  describe('persisted active trip state', () => {
+    it('saves normalized trip context for a restarted background task', async () => {
+      await persistActiveTripId('  trip-runtime-001  ');
+
+      await expect(getPersistedActiveTripId()).resolves.toBe('trip-runtime-001');
+    });
+
+    it('clears only the expected active trip context', async () => {
+      await persistActiveTripId('trip-runtime-002');
+      await clearPersistedActiveTripId('stale-trip');
+
+      await expect(getPersistedActiveTripId()).resolves.toBe('trip-runtime-002');
+      await clearPersistedActiveTripId('trip-runtime-002');
+      await expect(getPersistedActiveTripId()).resolves.toBeNull();
+    });
+
+    it('rejects empty trip context', async () => {
+      await expect(persistActiveTripId('   ')).rejects.toThrow(TypeError);
+    });
   });
 
   // -------------------------------------------------------------------------

@@ -1,49 +1,52 @@
-/**
- * Sprint 8.5 – AppInitializer Crash Recovery Tests
- *
- * Tests the app initialization logic that detects and recovers from
- * uncompleted trips after device crash/reboot scenarios.
- */
-
-// Mock dependencies before importing the module under test
-jest.mock('../../repositories/TripRepository', () => ({
-  TripRepository: {
-    getActiveTripIds: jest.fn(),
-  },
+jest.mock('../../db/LocalDatabase', () => ({
+  initDatabase: jest.fn(),
+  getPendingQueueEntries: jest.fn(),
 }));
+
 jest.mock('../BackgroundLocationWorker', () => ({
   BackgroundLocationWorker: {
     startTracking: jest.fn(),
-    stopTracking: jest.fn(),
+    restoreActiveTrip: jest.fn(),
+    resolveActiveTripId: jest.fn(),
+  },
+}));
+
+jest.mock('../StateCoordinator', () => ({
+  StateCoordinator: {
+    prepareRuntimeServices: jest.fn(),
+    syncAllSystems: jest.fn(),
+    startRuntimeServices: jest.fn(),
   },
 }));
 
 import {
-  initializeAppWithCrashRecovery,
+  getPendingQueueEntries,
+  initDatabase,
+} from '../../db/LocalDatabase';
+import { BackgroundLocationWorker } from '../BackgroundLocationWorker';
+import { StateCoordinator } from '../StateCoordinator';
+import {
   asyncInitializeApp,
+  initializeAppWithCrashRecovery,
 } from '../AppInitializer';
 
-const { TripRepository } = jest.requireMock('../../repositories/TripRepository') as {
-  TripRepository: {
-    getActiveTripIds: jest.Mock;
-  };
-};
+const mockGetPendingQueueEntries = jest.mocked(getPendingQueueEntries);
+const mockInitDatabase = jest.mocked(initDatabase);
+const mockBackgroundLocationWorker = jest.mocked(BackgroundLocationWorker);
+const mockStateCoordinator = jest.mocked(StateCoordinator);
 
-const { BackgroundLocationWorker } = jest.requireMock('../BackgroundLocationWorker') as {
-  BackgroundLocationWorker: {
-    startTracking: jest.Mock;
-    stopTracking: jest.Mock;
-  };
-};
-
-const mockTripRepository = TripRepository;
-const mockBackgroundLocationWorker = BackgroundLocationWorker;
-
-describe('AppInitializer – Crash Recovery', () => {
+describe('AppInitializer – mobile runtime recovery', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    mockInitDatabase.mockResolvedValue({} as never);
+    mockGetPendingQueueEntries.mockResolvedValue([]);
+    mockBackgroundLocationWorker.startTracking.mockResolvedValue(undefined);
+    mockBackgroundLocationWorker.restoreActiveTrip.mockResolvedValue(null);
+    mockBackgroundLocationWorker.resolveActiveTripId.mockResolvedValue(null);
+    mockStateCoordinator.prepareRuntimeServices.mockResolvedValue(undefined);
+    mockStateCoordinator.syncAllSystems.mockResolvedValue(undefined);
+    mockStateCoordinator.startRuntimeServices.mockResolvedValue(undefined);
     jest.spyOn(console, 'log').mockImplementation();
-    jest.spyOn(console, 'warn').mockImplementation();
     jest.spyOn(console, 'error').mockImplementation();
   });
 
@@ -51,123 +54,86 @@ describe('AppInitializer – Crash Recovery', () => {
     jest.restoreAllMocks();
   });
 
-  describe('initializeAppWithCrashRecovery()', () => {
-    it('should log clean state when no active trips exist', async () => {
-      mockTripRepository.getActiveTripIds.mockResolvedValue([]);
+  it('initializes SQLite before reading the outbox and starts runtime services', async () => {
+    await initializeAppWithCrashRecovery();
 
-      await initializeAppWithCrashRecovery();
-
-      expect(mockTripRepository.getActiveTripIds).toHaveBeenCalled();
-      expect(console.log).toHaveBeenCalledWith(
-        expect.stringContaining('No active trips found'),
-      );
-    });
-
-    it('should start tracking for each active trip found', async () => {
-      mockTripRepository.getActiveTripIds.mockResolvedValue([
-        'trip-001',
-        'trip-002',
-        'trip-003',
-      ]);
-      mockBackgroundLocationWorker.startTracking.mockResolvedValue(undefined);
-
-      await initializeAppWithCrashRecovery();
-
-      expect(mockBackgroundLocationWorker.startTracking).toHaveBeenCalledTimes(3);
-      expect(mockBackgroundLocationWorker.startTracking).toHaveBeenCalledWith('trip-001');
-      expect(mockBackgroundLocationWorker.startTracking).toHaveBeenCalledWith('trip-002');
-      expect(mockBackgroundLocationWorker.startTracking).toHaveBeenCalledWith('trip-003');
-    });
-
-    it('should log warning when active trips are detected', async () => {
-      mockTripRepository.getActiveTripIds.mockResolvedValue(['trip-001', 'trip-002']);
-      mockBackgroundLocationWorker.startTracking.mockResolvedValue(undefined);
-
-      await initializeAppWithCrashRecovery();
-
-      expect(console.warn).toHaveBeenCalledWith(
-        expect.stringContaining('Detected 2 active trip(s)'),
-      );
-    });
-
-    it('should continue recovery even if one trip fails to restore tracking', async () => {
-      mockTripRepository.getActiveTripIds.mockResolvedValue([
-        'trip-001',
-        'trip-002',
-        'trip-003',
-      ]);
-      mockBackgroundLocationWorker.startTracking
-        .mockResolvedValueOnce(undefined) // trip-001 succeeds
-        .mockRejectedValueOnce(new Error('Permissions denied')) // trip-002 fails
-        .mockResolvedValueOnce(undefined); // trip-003 succeeds
-
-      // Should NOT throw
-      await expect(initializeAppWithCrashRecovery()).resolves.not.toThrow();
-
-      // All three trips should have been attempted
-      expect(mockBackgroundLocationWorker.startTracking).toHaveBeenCalledTimes(3);
-
-      // Error should be logged but not fatal
-      expect(console.error).toHaveBeenCalledWith(
-        expect.stringContaining('Failed to restore tracking for trip trip-002'),
-        expect.any(Error),
-      );
-    });
-
-    it('should log success message after recovery completes', async () => {
-      mockTripRepository.getActiveTripIds.mockResolvedValue(['trip-001']);
-      mockBackgroundLocationWorker.startTracking.mockResolvedValue(undefined);
-
-      await initializeAppWithCrashRecovery();
-
-      expect(console.log).toHaveBeenCalledWith(
-        expect.stringContaining('Crash recovery completed'),
-      );
-    });
-
-    it('should re-throw if TripRepository query itself fails', async () => {
-      const error = new Error('Database unavailable');
-      mockTripRepository.getActiveTripIds.mockRejectedValue(error);
-
-      await expect(initializeAppWithCrashRecovery()).rejects.toThrow(error);
-
-      expect(console.error).toHaveBeenCalledWith(
-        '[AppInitializer] Fatal error during initialization:',
-        error,
-      );
-    });
-
-    it('should be idempotent – calling multiple times is safe', async () => {
-      mockTripRepository.getActiveTripIds.mockResolvedValue([]);
-
-      await initializeAppWithCrashRecovery();
-      await initializeAppWithCrashRecovery();
-
-      // Should not error or have side effects
-      expect(mockTripRepository.getActiveTripIds).toHaveBeenCalledTimes(2);
-    });
+    expect(mockInitDatabase).toHaveBeenCalledTimes(1);
+    expect(mockGetPendingQueueEntries).toHaveBeenCalledTimes(1);
+    expect(mockBackgroundLocationWorker.restoreActiveTrip).toHaveBeenCalledTimes(1);
+    expect(mockStateCoordinator.prepareRuntimeServices).toHaveBeenCalledTimes(1);
+    expect(mockStateCoordinator.syncAllSystems).not.toHaveBeenCalled();
+    expect(mockStateCoordinator.startRuntimeServices).toHaveBeenCalledWith(null);
   });
 
-  describe('asyncInitializeApp()', () => {
-    it('should be a thin wrapper around initializeAppWithCrashRecovery()', async () => {
-      mockTripRepository.getActiveTripIds.mockResolvedValue([]);
+  it('restores persisted trip tracking and runs recovery before starting daemons', async () => {
+    mockBackgroundLocationWorker.restoreActiveTrip.mockResolvedValue('trip-recovered');
+    mockGetPendingQueueEntries.mockResolvedValue([
+      { order_id: 'trip-recovered' },
+    ] as never);
 
-      await asyncInitializeApp();
+    await initializeAppWithCrashRecovery();
 
-      expect(mockTripRepository.getActiveTripIds).toHaveBeenCalled();
-    });
+    expect(mockStateCoordinator.syncAllSystems).toHaveBeenCalledWith('trip-recovered');
+    expect(mockStateCoordinator.startRuntimeServices).toHaveBeenCalledWith('trip-recovered');
+    expect(mockStateCoordinator.syncAllSystems.mock.invocationCallOrder[0]).toBeLessThan(
+      mockStateCoordinator.startRuntimeServices.mock.invocationCallOrder[0],
+    );
   });
 
-  describe('Operational Logging', () => {
-    it('should log trip-specific recovery messages for visibility', async () => {
-      mockTripRepository.getActiveTripIds.mockResolvedValue(['trip-abc-123']);
-      mockBackgroundLocationWorker.startTracking.mockResolvedValue(undefined);
+  it('recovers the first pending outbox order when no active trip is saved', async () => {
+    mockGetPendingQueueEntries.mockResolvedValue([
+      { order_id: 'trip-pending-001' },
+    ] as never);
 
-      await initializeAppWithCrashRecovery();
+    await initializeAppWithCrashRecovery();
 
-      expect(console.log).toHaveBeenCalledWith(
-        expect.stringContaining('Restoring background location tracking for trip: trip-abc-123'),
-      );
-    });
+    expect(mockStateCoordinator.syncAllSystems).toHaveBeenCalledWith('trip-pending-001');
+    expect(mockStateCoordinator.startRuntimeServices).toHaveBeenCalledWith(null);
+  });
+
+  it('starts a trip provided by the mobile runtime', async () => {
+    await initializeAppWithCrashRecovery(' trip-current ');
+
+    expect(mockBackgroundLocationWorker.startTracking).toHaveBeenCalledWith('trip-current');
+    expect(mockStateCoordinator.syncAllSystems).toHaveBeenCalledWith('trip-current');
+    expect(mockStateCoordinator.startRuntimeServices).toHaveBeenCalledWith('trip-current');
+  });
+
+  it('continues outbox recovery when location tracking cannot be restored', async () => {
+    mockBackgroundLocationWorker.restoreActiveTrip.mockRejectedValue(
+      new Error('Location permission denied'),
+    );
+    mockBackgroundLocationWorker.resolveActiveTripId.mockResolvedValue('trip-persisted');
+    mockGetPendingQueueEntries.mockResolvedValue([
+      { order_id: 'trip-persisted' },
+    ] as never);
+
+    await expect(initializeAppWithCrashRecovery()).resolves.toBeUndefined();
+
+    expect(mockStateCoordinator.syncAllSystems).toHaveBeenCalledWith('trip-persisted');
+    expect(mockStateCoordinator.startRuntimeServices).toHaveBeenCalledWith('trip-persisted');
+    expect(console.error).toHaveBeenCalledWith(
+      '[AppInitializer] Location tracking recovery failed:',
+      expect.any(Error),
+    );
+  });
+
+  it('surfaces local database initialization and recovery failures', async () => {
+    const error = new Error('Outbox unavailable');
+    mockGetPendingQueueEntries.mockRejectedValue(error);
+
+    await expect(initializeAppWithCrashRecovery()).rejects.toThrow(error);
+    expect(mockStateCoordinator.startRuntimeServices).not.toHaveBeenCalled();
+    expect(console.error).toHaveBeenCalledWith(
+      '[AppInitializer] Fatal error during initialization:',
+      error,
+    );
+  });
+
+  it('retains the asyncInitializeApp compatibility wrapper', async () => {
+    await asyncInitializeApp();
+
+    expect(mockInitDatabase).toHaveBeenCalledTimes(1);
+    expect(mockStateCoordinator.startRuntimeServices).toHaveBeenCalledWith(null);
   });
 });

@@ -6,6 +6,12 @@ import {
   SQLiteTelemetryRepository,
   type TelemetryPing,
 } from './SQLiteTelemetryRepository';
+import {
+  clearPersistedActiveTripId,
+  getPersistedActiveTripId,
+  initDatabase,
+  persistActiveTripId,
+} from '../db/LocalDatabase';
 
 export const KONA_BACKGROUND_LOCATION_TASK = 'KONA_BACKGROUND_LOCATION';
 
@@ -15,6 +21,7 @@ interface BackgroundLocationTaskData {
 
 export class BackgroundLocationWorker {
   private static activeTripId: string | null = null;
+  private static startTrackingPromise: Promise<void> | null = null;
   private static telemetryRepositoryPromise: Promise<SQLiteTelemetryRepository> | null = null;
 
   /**
@@ -26,8 +33,29 @@ export class BackgroundLocationWorker {
       throw new TypeError('[BackgroundLocationWorker] startTracking requires a non-empty tripId.');
     }
 
-    this.activeTripId = normalizedTripId;
+    if (this.activeTripId === normalizedTripId) {
+      return;
+    }
 
+    if (this.startTrackingPromise) {
+      await this.startTrackingPromise;
+      if (this.activeTripId === normalizedTripId) {
+        return;
+      }
+    }
+
+    const operation = this.startTrackingInternal(normalizedTripId);
+    this.startTrackingPromise = operation;
+    try {
+      await operation;
+    } finally {
+      if (this.startTrackingPromise === operation) {
+        this.startTrackingPromise = null;
+      }
+    }
+  }
+
+  private static async startTrackingInternal(normalizedTripId: string): Promise<void> {
     const foregroundPermission = await Location.requestForegroundPermissionsAsync();
     if (foregroundPermission.status !== 'granted') {
       throw new Error('[BackgroundLocationWorker] Foreground location permission was denied.');
@@ -38,28 +66,68 @@ export class BackgroundLocationWorker {
       throw new Error('[BackgroundLocationWorker] Background location permission was denied.');
     }
 
-    const alreadyStarted = await Location.hasStartedLocationUpdatesAsync(
-      KONA_BACKGROUND_LOCATION_TASK,
-    );
-    if (alreadyStarted) {
-      return;
+    await initDatabase();
+    const previousTripId = await getPersistedActiveTripId();
+    await persistActiveTripId(normalizedTripId);
+    this.activeTripId = normalizedTripId;
+
+    try {
+      const alreadyStarted = await Location.hasStartedLocationUpdatesAsync(
+        KONA_BACKGROUND_LOCATION_TASK,
+      );
+      if (!alreadyStarted) {
+        await Location.startLocationUpdatesAsync(KONA_BACKGROUND_LOCATION_TASK, {
+          accuracy: Location.Accuracy.BestForNavigation,
+          timeInterval: 5000,
+          deferredUpdatesInterval: 10000,
+          foregroundService: {
+            notificationTitle: 'KONA Tracking Active',
+            notificationBody: 'Recording route telemetry safely offline',
+          },
+        });
+      }
+    } catch (error) {
+      if (previousTripId) {
+        await persistActiveTripId(previousTripId);
+      } else {
+        await clearPersistedActiveTripId(normalizedTripId);
+      }
+      this.activeTripId = previousTripId;
+      throw error;
+    }
+  }
+
+  public static async restoreActiveTrip(): Promise<string | null> {
+    await initDatabase();
+    const persistedTripId = await getPersistedActiveTripId();
+    if (!persistedTripId) {
+      this.activeTripId = null;
+      return null;
     }
 
-    await Location.startLocationUpdatesAsync(KONA_BACKGROUND_LOCATION_TASK, {
-      accuracy: Location.Accuracy.BestForNavigation,
-      timeInterval: 5000,
-      deferredUpdatesInterval: 10000,
-      foregroundService: {
-        notificationTitle: 'KONA Tracking Active',
-        notificationBody: 'Recording route telemetry safely offline',
-      },
-    });
+    await this.startTracking(persistedTripId);
+    return persistedTripId;
+  }
+
+  public static async resolveActiveTripId(): Promise<string | null> {
+    if (this.activeTripId) {
+      return this.activeTripId;
+    }
+
+    await initDatabase();
+    this.activeTripId = await getPersistedActiveTripId();
+    return this.activeTripId;
   }
 
   /**
    * Stops background location updates and clears active trip context.
    */
   public static async stopTracking(): Promise<void> {
+    if (this.startTrackingPromise) {
+      await this.startTrackingPromise;
+    }
+
+    const stoppedTripId = this.activeTripId;
     const started = await Location.hasStartedLocationUpdatesAsync(
       KONA_BACKGROUND_LOCATION_TASK,
     );
@@ -68,6 +136,8 @@ export class BackgroundLocationWorker {
       await Location.stopLocationUpdatesAsync(KONA_BACKGROUND_LOCATION_TASK);
     }
 
+    await initDatabase();
+    await clearPersistedActiveTripId(stoppedTripId ?? undefined);
     this.activeTripId = null;
   }
 
@@ -143,7 +213,17 @@ if (!TaskManager.isTaskDefined(KONA_BACKGROUND_LOCATION_TASK)) {
         return;
       }
 
-      const tripId = BackgroundLocationWorker.getActiveTripId();
+      let tripId: string | null;
+      try {
+        tripId = await BackgroundLocationWorker.resolveActiveTripId();
+      } catch (taskError) {
+        console.error(
+          '[BackgroundLocationWorker] Failed to resolve persisted trip context:',
+          taskError,
+        );
+        return;
+      }
+
       if (!tripId) {
         console.warn(
           '[BackgroundLocationWorker] Received background location with no active tripId; dropping sample.',
