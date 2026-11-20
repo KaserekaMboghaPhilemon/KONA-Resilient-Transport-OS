@@ -71,10 +71,7 @@ jobs:
       - name: Build backend
         run: npm run build
 
-      - name: Run tests
-        run: npm test -- --runInBand --forceExit
-
-      - name: Start backend for system verification
+      - name: Start backend for integration and system verification
         run: |
           npm start > backend.log 2>&1 &
           echo $! > backend.pid
@@ -86,6 +83,9 @@ jobs:
           done
           cat backend.log
           exit 1
+
+      - name: Run tests
+        run: npm test -- --runInBand --forceExit
 
       - name: Verify PostgreSQL, pgvector, Redis, and backend
         run: npx ts-node src/scripts/validate-system.ts
