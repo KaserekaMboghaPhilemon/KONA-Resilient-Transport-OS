@@ -305,3 +305,5 @@ export class SyncMetrics {
     return `${lines.join('\n')}\n`;
   }
 }
+
+export const syncMetrics = new SyncMetrics();
