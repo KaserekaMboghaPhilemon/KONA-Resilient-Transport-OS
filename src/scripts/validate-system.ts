@@ -115,11 +115,62 @@ async function validatePostgres(): Promise<CheckDetails> {
       throw new Error('pgvector distance query returned an unexpected nearest embedding.');
     }
 
+    const migrationTables = await client.query<{ table_name: string }>(
+      `SELECT table_name
+       FROM information_schema.tables
+       WHERE table_schema = 'public'
+         AND table_name IN (
+           'trips',
+           'telemetry_ingestion_batches',
+           'processed_idempotency_keys',
+           'ledger_transactions',
+           'ledger_entries'
+         )`,
+    );
+    const requiredTables = new Set([
+      'trips',
+      'telemetry_ingestion_batches',
+      'processed_idempotency_keys',
+      'ledger_transactions',
+      'ledger_entries',
+    ]);
+    const missingTables = [...requiredTables].filter(
+      (tableName) => !migrationTables.rows.some((row) => row.table_name === tableName),
+    );
+    if (missingTables.length > 0) {
+      throw new Error(`Required database tables are missing: ${missingTables.join(', ')}.`);
+    }
+
+    const ledgerBalance = await client.query<{ unbalanced_transactions: string }>(
+      `SELECT COUNT(*)::text AS unbalanced_transactions
+       FROM (
+         SELECT lt.ledger_transaction_id
+         FROM ledger_transactions lt
+         LEFT JOIN ledger_entries le
+           ON le.ledger_transaction_id = lt.ledger_transaction_id
+         WHERE lt.status = 'posted'
+         GROUP BY lt.ledger_transaction_id
+         HAVING COALESCE(SUM(
+           CASE le.entry_side
+             WHEN 'debit' THEN le.amount_minor
+             WHEN 'credit' THEN -le.amount_minor
+             ELSE 0
+           END
+         ), 0) <> 0
+            OR COUNT(le.ledger_entry_id) < 2
+       ) unbalanced`,
+    );
+    if (Number(ledgerBalance.rows[0]?.unbalanced_transactions ?? '1') !== 0) {
+      throw new Error('One or more posted ledger transactions are unbalanced.');
+    }
+
     details = {
       currentTime: currentTime.toISOString(),
       vectorVersion,
       hnswIndexCreated: true,
       nearestEmbeddingDistance: Number(nearest.distance),
+      requiredTablesPresent: true,
+      postedLedgerTransactionsBalanced: true,
     };
   } catch (error) {
     failure = error;

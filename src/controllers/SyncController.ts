@@ -231,6 +231,26 @@ export class SyncController {
       throw new TypeError('[SyncController] Missing or malformed required field: "payload".');
     }
 
+    const ledgerActionTypes = new Set([
+      'BOOKING_LOCK',
+      'BOOKING_REVERSAL',
+      'TRIP_SETTLEMENT',
+      'ORDER_STATUS_UPDATE',
+      'DRIVER_LOCATION_UPDATE',
+      'DISPATCH_OFFER_RESPONSE',
+    ]);
+    if (
+      ledgerActionTypes.has(String(typedAction.action_type)) &&
+      (typeof envelope.__kona_signature_hex !== 'string' ||
+        envelope.__kona_signature_hex.trim().length === 0 ||
+        typeof envelope.__kona_raw_wire !== 'string' ||
+        envelope.__kona_raw_wire.trim().length === 0)
+    ) {
+      throw new SignatureAuthenticationError(
+        '[SyncController] Ledger actions require a signed action envelope.',
+      );
+    }
+
     const normalizedAction = typedAction as KonaSyncAction;
     const authenticatedDriverId = await this.verifyIncomingSignature(
       normalizedAction.payload,

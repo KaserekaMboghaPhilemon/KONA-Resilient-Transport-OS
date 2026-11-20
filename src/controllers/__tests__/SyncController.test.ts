@@ -296,6 +296,22 @@ describe('SyncController – Sprint 8.5 Lifecycle Binding Tests', () => {
     });
 
     describe('SMS authentication and offline-ledger dispatch', () => {
+      it('rejects unsigned direct HTTP ledger actions', async () => {
+        await expect(
+          SyncController.executeAction({
+            idempotency_key: 'unsigned-ledger-action',
+            action_type: 'DRIVER_LOCATION_UPDATE',
+            payload: {
+              order_id: 'trip-1',
+              driver_id: 'driver-xyz',
+              h3_cell: '8928308280fffff',
+            },
+          }),
+        ).rejects.toThrow(/signed action envelope/i);
+
+        expect(mockOfflineLedgerRepository.apply).not.toHaveBeenCalled();
+      });
+
       it('authenticates the gateway sender, restores the driver identity, and dispatches a ledger action', async () => {
         const rawWire = 'BASE45_CANONICAL_JSON';
         const signature = await CryptoSignatureEngine.generateSignature(
