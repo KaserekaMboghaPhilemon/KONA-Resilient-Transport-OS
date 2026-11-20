@@ -64,6 +64,7 @@
         "testMatch": [
           "<rootDir>/src/db/**/*.test.ts",
           "<rootDir>/src/services/**/*.test.ts",
+          "<rootDir>/src/workers/**/*.test.ts",
           "<rootDir>/src/routes/**/*.test.ts",
           "<rootDir>/src/controllers/**/*.test.ts",
           "<rootDir>/src/repositories/**/*.test.ts",
